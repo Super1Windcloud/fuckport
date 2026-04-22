@@ -90,15 +90,15 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> bool {
             true
         }
         KeyCode::Enter => !state.selected.is_empty(),
-        KeyCode::Char('1') => {
+        KeyCode::F(1) => {
             state.set_sort_mode(SortMode::Cpu);
             false
         }
-        KeyCode::Char('2') => {
+        KeyCode::F(2) => {
             state.set_sort_mode(SortMode::Memory);
             false
         }
-        KeyCode::Char('3') => {
+        KeyCode::F(3) => {
             state.set_sort_mode(SortMode::Name);
             false
         }
@@ -266,11 +266,11 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let selected = state.selected.len();
     let sort = state.sort_mode.label();
     let line = Line::from(vec![
-        "1".cyan().bold(),
+        "F1".cyan().bold(),
         " CPU  ".dark_gray(),
-        "2".cyan().bold(),
+        "F2".cyan().bold(),
         " Memory  ".dark_gray(),
-        "3".cyan().bold(),
+        "F3".cyan().bold(),
         " Name  ".dark_gray(),
         "Space".cyan().bold(),
         " toggle  ".dark_gray(),
