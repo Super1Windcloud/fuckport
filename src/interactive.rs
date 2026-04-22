@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -80,6 +80,10 @@ fn drain_pending_events() -> AppResult<()> {
 }
 
 fn handle_key_event(state: &mut AppState, key: KeyEvent) -> bool {
+    if key.kind != KeyEventKind::Press {
+        return false;
+    }
+
     match key.code {
         KeyCode::Esc => {
             state.cancelled = true;
