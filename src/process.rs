@@ -10,8 +10,11 @@ use crate::input::Target;
 #[derive(Clone, Debug)]
 pub struct ProcessRecord {
     pub pid: Pid,
+    pub app_name: String,
     pub name: String,
     pub cmd: String,
+    pub cpu_usage: f32,
+    pub memory_bytes: u64,
     pub ports: BTreeSet<u16>,
 }
 
@@ -59,8 +62,11 @@ impl ProcessCatalog {
             .values()
             .map(|process| ProcessRecord {
                 pid: process.pid(),
+                app_name: app_name_for_process(process),
                 name: process.name().to_string_lossy().into_owned(),
                 cmd: join_cmd(process.cmd()),
+                cpu_usage: process.cpu_usage(),
+                memory_bytes: process.memory(),
                 ports: self
                     .ports_by_pid
                     .get(&process.pid())
@@ -70,8 +76,12 @@ impl ProcessCatalog {
             .collect::<Vec<_>>();
 
         records.sort_by(|left, right| {
-            left.name
-                .cmp(&right.name)
+            right
+                .cpu_usage
+                .partial_cmp(&left.cpu_usage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(left.app_name.cmp(&right.app_name))
+                .then(left.name.cmp(&right.name))
                 .then(left.pid.as_u32().cmp(&right.pid.as_u32()))
         });
         records
@@ -146,6 +156,19 @@ fn join_cmd(parts: &[OsString]) -> String {
         .map(|part| part.to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn app_name_for_process(process: &sysinfo::Process) -> String {
+    if let Some(exe) = process.exe()
+        && let Some(stem) = exe.file_stem()
+    {
+        let value = stem.to_string_lossy().trim().to_string();
+        if !value.is_empty() {
+            return value;
+        }
+    }
+
+    process.name().to_string_lossy().into_owned()
 }
 
 fn port_map() -> AppResult<BTreeMap<u16, BTreeSet<Pid>>> {
