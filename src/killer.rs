@@ -143,7 +143,7 @@ fn backoff_intervals(timeout: Duration) -> Vec<u64> {
         let next = current.min(timeout_ms - elapsed);
         intervals.push(next);
         elapsed += next;
-        current = (current.saturating_mul(2)).min(1_000);
+        current = current.saturating_mul(2).min(1_000);
     }
 
     intervals
