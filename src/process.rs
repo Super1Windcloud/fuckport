@@ -1,8 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+#[cfg(windows)]
+use std::ffi::c_void;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::path::Path;
 
 use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, get_sockets_info};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+};
 
 use crate::error::AppResult;
 use crate::input::Target;
@@ -159,16 +169,128 @@ fn join_cmd(parts: &[OsString]) -> String {
 }
 
 fn app_name_for_process(process: &sysinfo::Process) -> String {
-    if let Some(exe) = process.exe()
-        && let Some(stem) = exe.file_stem()
-    {
-        let value = stem.to_string_lossy().trim().to_string();
-        if !value.is_empty() {
-            return value;
+    if let Some(exe) = process.exe() {
+        #[cfg(windows)]
+        if let Some(description) = windows_file_description(exe) {
+            return description;
+        }
+
+        if let Some(name) = file_name_value(exe) {
+            return name;
         }
     }
 
-    process.name().to_string_lossy().into_owned()
+    let process_name = process.name().to_string_lossy().trim().to_string();
+    if !process_name.is_empty() {
+        return process_name;
+    }
+
+    String::from("<unknown>")
+}
+
+fn file_name_value(path: &std::path::Path) -> Option<String> {
+    if let Some(name) = path.file_name() {
+        let value = name.to_string_lossy().trim().to_string();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+
+    path.file_stem().and_then(|stem| {
+        let value = stem.to_string_lossy().trim().to_string();
+        if value.is_empty() { None } else { Some(value) }
+    })
+}
+
+#[cfg(windows)]
+fn windows_file_description(path: &Path) -> Option<String> {
+    let mut wide_path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide_path.push(0);
+
+    let mut handle = 0;
+    let size = unsafe { GetFileVersionInfoSizeW(wide_path.as_ptr(), &mut handle) };
+    if size == 0 {
+        return None;
+    }
+
+    let mut buffer = vec![0_u8; size as usize];
+    let loaded = unsafe {
+        GetFileVersionInfoW(wide_path.as_ptr(), 0, size, buffer.as_mut_ptr().cast::<c_void>())
+    };
+    if loaded == 0 {
+        return None;
+    }
+
+    let mut queries = version_translation_queries(&buffer);
+    queries.push(wide_query(r"\StringFileInfo\040904b0\FileDescription"));
+    queries.push(wide_query(r"\StringFileInfo\040904e4\FileDescription"));
+
+    for query in queries {
+        if let Some(value) = query_version_value(&buffer, &query) {
+            return Some(value);
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn version_translation_queries(buffer: &[u8]) -> Vec<Vec<u16>> {
+    let mut pointer = std::ptr::null_mut::<c_void>();
+    let mut length = 0_u32;
+    let query = wide_query(r"\VarFileInfo\Translation");
+
+    let found = unsafe {
+        VerQueryValueW(
+            buffer.as_ptr().cast::<c_void>(),
+            query.as_ptr(),
+            &mut pointer,
+            &mut length,
+        )
+    };
+    if found == 0 || pointer.is_null() || length < 4 {
+        return Vec::new();
+    }
+
+    let translations = unsafe {
+        std::slice::from_raw_parts(pointer.cast::<u16>(), (length as usize) / 2)
+    };
+
+    translations
+        .chunks_exact(2)
+        .map(|chunk| format!(r"\StringFileInfo\{:04x}{:04x}\FileDescription", chunk[0], chunk[1]))
+        .map(|query| wide_query(&query))
+        .collect()
+}
+
+#[cfg(windows)]
+fn query_version_value(buffer: &[u8], query: &[u16]) -> Option<String> {
+    let mut pointer = std::ptr::null_mut::<c_void>();
+    let mut length = 0_u32;
+    let found = unsafe {
+        VerQueryValueW(
+            buffer.as_ptr().cast::<c_void>(),
+            query.as_ptr(),
+            &mut pointer,
+            &mut length,
+        )
+    };
+    if found == 0 || pointer.is_null() || length == 0 {
+        return None;
+    }
+
+    let text = unsafe { std::slice::from_raw_parts(pointer.cast::<u16>(), length as usize) };
+    let value = String::from_utf16_lossy(text)
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+
+    if value.is_empty() { None } else { Some(value) }
+}
+
+#[cfg(windows)]
+fn wide_query(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 fn port_map() -> AppResult<BTreeMap<u16, BTreeSet<Pid>>> {

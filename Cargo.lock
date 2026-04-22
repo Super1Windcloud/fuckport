@@ -522,6 +522,7 @@ dependencies = [
  "netstat2",
  "ratatui",
  "sysinfo",
+ "windows-sys",
 ]
 
 [[package]]
