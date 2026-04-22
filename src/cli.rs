@@ -7,7 +7,7 @@ fn help_styles() -> Styles {
     Styles::styled()
         .header(AnsiColor::BrightBlue.on_default().effects(Effects::BOLD))
         .usage(AnsiColor::BrightBlue.on_default().effects(Effects::BOLD))
-        .literal(AnsiColor::BrightYellow.on_default().effects(Effects::BOLD))
+        .literal(AnsiColor::BrightCyan.on_default().effects(Effects::BOLD))
         .placeholder(AnsiColor::BrightGreen.on_default())
         .valid(AnsiColor::BrightGreen.on_default())
         .invalid(AnsiColor::BrightRed.on_default().effects(Effects::BOLD))
