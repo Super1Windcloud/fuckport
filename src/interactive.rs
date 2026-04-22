@@ -38,6 +38,7 @@ fn run_app(
     verbose: bool,
 ) -> AppResult<AppState> {
     let mut state = AppState::new(records, verbose);
+    drain_pending_events()?;
 
     loop {
         terminal
@@ -69,13 +70,22 @@ fn restore_terminal(mut terminal: DefaultTerminal) -> io::Result<()> {
     Ok(())
 }
 
+fn drain_pending_events() -> AppResult<()> {
+    while event::poll(Duration::from_millis(0))
+        .map_err(|error| format!("failed to drain terminal events: {error}"))?
+    {
+        let _ = event::read().map_err(|error| format!("failed to read terminal event: {error}"))?;
+    }
+    Ok(())
+}
+
 fn handle_key_event(state: &mut AppState, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => {
             state.cancelled = true;
             true
         }
-        KeyCode::Enter => true,
+        KeyCode::Enter => !state.selected.is_empty(),
         KeyCode::Up => {
             state.move_up();
             false

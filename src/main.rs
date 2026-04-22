@@ -18,13 +18,18 @@ fn main() {
 
 fn run(cli: Cli) -> AppResult<()> {
     let mut catalog = ProcessCatalog::load()?;
+    let interactive_mode = cli.interactive || cli.targets.is_empty();
 
-    let selected_pids = if cli.interactive || cli.targets.is_empty() {
+    let selected_pids = if interactive_mode {
         pick_interactive(&catalog, cli.verbose)?
     } else {
         let targets = parse_targets(&cli.targets);
         catalog.resolve_targets(&targets, cli.case_sensitive)?
     };
+
+    if interactive_mode && selected_pids.is_empty() {
+        return Ok(());
+    }
 
     let options = KillOptions {
         force: cli.force,
