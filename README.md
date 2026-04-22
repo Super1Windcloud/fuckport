@@ -38,6 +38,8 @@ cargo build --release
 ```bash
 fuckport [OPTIONS] [TARGET]...
 ```
+![img.png](img.png)
+
 
 Targets:
 
