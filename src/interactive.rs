@@ -189,7 +189,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         Cell::from("PID"),
         Cell::from("App"),
         Cell::from("Process"),
-        Cell::from("CPU"),
+        Cell::from(format!("{:>6}", "CPU")),
         Cell::from("Memory"),
         Cell::from("Ports"),
     ])
@@ -233,11 +233,11 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         [
             Constraint::Length(5),
             Constraint::Length(7),
-            Constraint::Length(24),
-            Constraint::Percentage(45),
+            Constraint::Length(18),
+            Constraint::Fill(3),
             Constraint::Length(8),
             Constraint::Length(10),
-            Constraint::Min(8),
+            Constraint::Fill(2),
         ],
     )
     .header(header)
