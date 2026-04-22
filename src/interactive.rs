@@ -20,10 +20,11 @@ pub fn pick_interactive(catalog: &ProcessCatalog, verbose: bool) -> AppResult<BT
     let selections = MultiSelect::with_theme(&ColorfulTheme::default())
         .with_prompt("Select processes to kill")
         .items(&items)
-        .interact()
+        .interact_opt()
         .map_err(|error| format!("interactive selection failed: {error}"))?;
 
     Ok(selections
+        .unwrap_or_default()
         .into_iter()
         .map(|index| records[index].pid)
         .collect())

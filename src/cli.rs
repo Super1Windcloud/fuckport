@@ -1,10 +1,26 @@
-use clap::{ArgAction, Parser};
+use clap::{
+    ArgAction, Parser,
+    builder::styling::{AnsiColor, Effects, Styles},
+};
+
+fn help_styles() -> Styles {
+    Styles::styled()
+        .header(AnsiColor::BrightBlue.on_default().effects(Effects::BOLD))
+        .usage(AnsiColor::BrightBlue.on_default().effects(Effects::BOLD))
+        .literal(AnsiColor::BrightYellow.on_default().effects(Effects::BOLD))
+        .placeholder(AnsiColor::BrightGreen.on_default())
+        .valid(AnsiColor::BrightGreen.on_default())
+        .invalid(AnsiColor::BrightRed.on_default().effects(Effects::BOLD))
+        .error(AnsiColor::BrightRed.on_default().effects(Effects::BOLD))
+}
 
 #[derive(Debug, Parser)]
 #[command(
     name = "fuckport",
     version,
-    about = "Kill processes by PID, name, or port."
+    about = "Kill processes by PID, name, or port.",
+    styles = help_styles(),
+    after_help = "Examples:\n  fuckport 1337\n  fuckport safari\n  fuckport :8080\n  fuckport 1337 safari :8080\n  fuckport"
 )]
 pub struct Cli {
     /// One or more targets: PID (`1234`), name (`chrome`), or port (`:3000`)

@@ -57,12 +57,41 @@ Options:
 
 ## Examples
 
+Kill a process by PID:
+
 ```bash
-fuckport :5173
-fuckport node vite
-fuckport 4242 -f
-fuckport --interactive
+fuckport 1337
 ```
+
+Kill a process by name:
+
+```bash
+fuckport safari
+```
+
+Kill whatever is listening on a port:
+
+```bash
+fuckport :8080
+```
+
+Kill multiple targets in one command:
+
+```bash
+fuckport 1337 safari :8080
+```
+
+Run without arguments to open the interactive interface:
+
+```bash
+fuckport
+```
+
+To kill a port, prefix it with a colon, for example `:8080`.
+
+The interactive interface can be closed with `Esc` without killing anything.
+
+Process name matching is case-insensitive by default. Queries containing uppercase letters use smart-case matching.
 
 Library-style examples:
 
