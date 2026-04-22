@@ -6,9 +6,10 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::path::Path;
+use std::thread;
 
 use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, get_sockets_info};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{MINIMUM_CPU_UPDATE_INTERVAL, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
@@ -156,7 +157,17 @@ fn refresh_processes(system: &mut System) {
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
-        ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet),
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_cpu(),
+    );
+    thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_cpu(),
     );
 }
 
