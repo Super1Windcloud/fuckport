@@ -26,6 +26,7 @@ pub fn kill_processes(
     }
 
     let mut failed = Vec::new();
+    let mut warnings = Vec::new();
     let mut killed_any = false;
 
     for pid in pids {
@@ -39,7 +40,6 @@ pub fn kill_processes(
 
         catalog.refresh();
         let Some(process) = catalog.system().process(*pid) else {
-            failed.push(format!("{} (already exited)", pid.as_u32()));
             continue;
         };
 
@@ -72,12 +72,23 @@ pub fn kill_processes(
                 println!("Killed {} ({name}) via {mode}", pid.as_u32());
             }
         } else {
-            failed.push(format!("{} ({name})", pid.as_u32()));
+            if killed {
+                warnings.push(format!(
+                    "{} ({name}, kill sent but exit was not confirmed in time)",
+                    pid.as_u32()
+                ));
+            } else {
+                failed.push(format!("{} ({name}, failed to send kill)", pid.as_u32()));
+            }
         }
     }
 
     if !failed.is_empty() {
         return Err(format!("failed to kill: {}", failed.join(", ")));
+    }
+
+    if !warnings.is_empty() && !options.silent {
+        eprintln!("Warning: {}", warnings.join(", "));
     }
 
     if !killed_any && !options.silent {
@@ -155,5 +166,11 @@ mod tests {
         let intervals = backoff_intervals(Duration::from_millis(3_000));
         assert_eq!(&intervals[..5], &[50, 100, 200, 400, 800]);
         assert!(intervals.iter().all(|value| *value <= 1_000));
+    }
+
+    #[test]
+    fn zero_timeout_has_no_wait_intervals() {
+        let intervals = backoff_intervals(Duration::from_millis(0));
+        assert!(intervals.is_empty());
     }
 }
