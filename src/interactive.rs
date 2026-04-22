@@ -150,6 +150,10 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> bool {
             state.pop_query();
             false
         }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.select_all_filtered();
+            false
+        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.cancelled = true;
             true
@@ -289,6 +293,8 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         " Name  ".dark_gray(),
         "Space".cyan().bold(),
         " toggle  ".dark_gray(),
+        "Ctrl+A".cyan().bold(),
+        " all  ".dark_gray(),
         "Tab".cyan().bold(),
         " search  ".dark_gray(),
         "Enter".green().bold(),
@@ -659,6 +665,14 @@ impl AppState {
         }
     }
 
+    fn select_all_filtered(&mut self) {
+        self.selected.extend(
+            self.filtered_indexes
+                .iter()
+                .map(|index| self.records[*index].pid),
+        );
+    }
+
     fn current_pid(&self) -> Option<Pid> {
         self.filtered_indexes
             .get(self.cursor)
@@ -1007,5 +1021,21 @@ mod tests {
                 .map(|record| record.app_name.as_str()),
             Some("aaa")
         );
+    }
+
+    #[test]
+    fn ctrl_a_selects_all_filtered_records() {
+        let mut second = sample_record();
+        second.pid = Pid::from_u32(99);
+        second.app_name = "firefox".to_string();
+        second.name = "firefox.exe".to_string();
+        second.cmd = "firefox.exe".to_string();
+        let records = vec![sample_record(), second];
+        let mut state = AppState::new(records, false);
+        state.push_query('c');
+        state.select_all_filtered();
+
+        assert_eq!(state.selected.len(), 1);
+        assert!(state.selected.contains(&Pid::from_u32(42)));
     }
 }
