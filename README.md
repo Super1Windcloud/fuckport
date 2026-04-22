@@ -1,5 +1,9 @@
 # fuckport
 
+[![crates.io](https://img.shields.io/crates/v/fuckport.svg)](https://crates.io/crates/fuckport)
+[![docs.rs](https://img.shields.io/docsrs/fuckport)](https://docs.rs/fuckport)
+[![license](https://img.shields.io/crates/l/fuckport.svg)](LICENSE)
+
 `fuckport` is a small command-line tool for stopping processes by PID, process name, or listening port.
 
 ## Features
@@ -12,6 +16,12 @@
 - Graceful shutdown first, with automatic fallback to force kill
 
 ## Install
+
+```bash
+cargo install fuckport
+```
+
+For local development:
 
 ```bash
 cargo install --path .
@@ -65,4 +75,11 @@ cargo run --example list_processes
 
 ```bash
 cargo test
+```
+
+## Release
+
+```bash
+cargo package
+cargo publish
 ```
