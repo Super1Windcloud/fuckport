@@ -24,6 +24,7 @@ crossterm = "0.29.0"
 netstat2 = "0.11.2"
 ratatui = "0.30.0"
 sysinfo = "0.38.4"
+unicode-width = "0.2.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

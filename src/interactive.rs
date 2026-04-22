@@ -14,6 +14,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Widget};
 use ratatui::{DefaultTerminal, Frame};
 use sysinfo::Pid;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::error::AppResult;
 use crate::process::{ProcessCatalog, ProcessRecord};
@@ -434,18 +435,16 @@ fn compute_table_widths(
     let flexible = total_width.saturating_sub(reserved + spacing);
 
     let app_target = content_width(
-        records.iter().map(|record| record.app_name.chars().count()),
+        records.iter().map(|record| UnicodeWidthStr::width(record.app_name.as_str())),
         APP_MIN_WIDTH,
         APP_MAX_WIDTH,
     );
     let process_target = content_width(
         records.iter().map(|record| {
             if verbose && !record.cmd.is_empty() {
-                format!("{} | {}", record.name, truncate(&record.cmd, 48))
-                    .chars()
-                    .count()
+                UnicodeWidthStr::width(format!("{} | {}", record.name, truncate(&record.cmd, 48)).as_str())
             } else {
-                record.name.chars().count()
+                UnicodeWidthStr::width(record.name.as_str())
             }
         }),
         PROCESS_MIN_WIDTH,
@@ -488,7 +487,11 @@ where
 }
 
 fn longest_line_width(value: &str) -> usize {
-    value.lines().map(|line| line.chars().count()).max().unwrap_or(0)
+    value
+        .lines()
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0)
 }
 
 fn allocate_flexible_widths(total: u16, specs: [(u16, u16); 3]) -> (u16, u16, u16) {
@@ -562,7 +565,7 @@ fn wrap_line(value: &str, width: usize) -> Vec<String> {
     let mut current = String::new();
 
     for word in value.split_whitespace() {
-        let word_len = word.chars().count();
+        let word_len = UnicodeWidthStr::width(word);
 
         if current.is_empty() {
             if word_len <= width {
@@ -574,7 +577,7 @@ fn wrap_line(value: &str, width: usize) -> Vec<String> {
             continue;
         }
 
-        let candidate_len = current.chars().count() + 1 + word_len;
+        let candidate_len = UnicodeWidthStr::width(current.as_str()) + 1 + word_len;
         if candidate_len <= width {
             current.push(' ');
             current.push_str(word);
@@ -600,11 +603,21 @@ fn wrap_line(value: &str, width: usize) -> Vec<String> {
 fn split_long_word(value: &str, width: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
+    let mut current_width = 0;
 
     for ch in value.chars() {
-        current.push(ch);
-        if current.chars().count() >= width {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width > 0 && current_width + ch_width > width {
             chunks.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+
+        current.push(ch);
+        current_width += ch_width;
+
+        if current_width >= width {
+            chunks.push(std::mem::take(&mut current));
+            current_width = 0;
         }
     }
 
