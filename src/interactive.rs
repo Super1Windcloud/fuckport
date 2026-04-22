@@ -18,7 +18,7 @@ use sysinfo::Pid;
 use crate::error::AppResult;
 use crate::process::{ProcessCatalog, ProcessRecord};
 
-const TABLE_COLUMN_SPACING: u16 = 1;
+const TABLE_COLUMN_SPACING: u16 = 2;
 const SEL_WIDTH: u16 = 5;
 const PID_WIDTH: u16 = 7;
 const CPU_WIDTH: u16 = 8;
@@ -223,6 +223,8 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 
     let filtered_records = state.filtered_records();
     let widths = compute_table_widths(&filtered_records, state.verbose, area.width);
+    let app_width = constraint_length(widths[2]);
+    let process_width = constraint_length(widths[3]);
     let rows = filtered_records.into_iter().map(|record| {
         let selected = if state.is_selected(record.pid) {
             "[x]"
@@ -238,19 +240,26 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 
         let cpu_style = cpu_style(record.cpu_usage);
         let mem_style = memory_style(record.memory_bytes);
+        let wrapped_app_name = wrap_cell_text(&record.app_name, app_width);
+        let wrapped_process_name = wrap_cell_text(&process_name, process_width);
         let wrapped_ports = format_ports_wrapped(&record.ports);
-        let port_lines = wrapped_ports.lines().count().max(1) as u16;
+        let row_lines = wrapped_app_name
+            .lines()
+            .count()
+            .max(wrapped_process_name.lines().count())
+            .max(wrapped_ports.lines().count())
+            .max(1) as u16;
 
         Row::new([
             Cell::from(selected),
             Cell::from(record.pid.as_u32().to_string()),
-            Cell::from(truncate(&record.app_name, 22)),
-            Cell::from(truncate(&process_name, 42)),
+            Cell::from(wrapped_app_name),
+            Cell::from(wrapped_process_name),
             Cell::from(format!("{:>5.1}%", record.cpu_usage)).style(cpu_style),
             Cell::from(format_memory(record.memory_bytes)).style(mem_style),
             Cell::from(wrapped_ports),
         ])
-        .height(port_lines)
+        .height(row_lines)
     });
 
     let table = Table::new(
@@ -518,6 +527,92 @@ fn allocate_flexible_widths(total: u16, specs: [(u16, u16); 3]) -> (u16, u16, u1
     }
 
     (widths[0], widths[1], widths[2])
+}
+
+fn constraint_length(constraint: Constraint) -> usize {
+    match constraint {
+        Constraint::Length(length) => length as usize,
+        _ => 1,
+    }
+}
+
+fn wrap_cell_text(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let mut lines = Vec::new();
+    for raw_line in value.lines() {
+        lines.extend(wrap_line(raw_line, width));
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        lines.join("\n")
+    }
+}
+
+fn wrap_line(value: &str, width: usize) -> Vec<String> {
+    if value.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in value.split_whitespace() {
+        let word_len = word.chars().count();
+
+        if current.is_empty() {
+            if word_len <= width {
+                current.push_str(word);
+                continue;
+            }
+
+            lines.extend(split_long_word(word, width));
+            continue;
+        }
+
+        let candidate_len = current.chars().count() + 1 + word_len;
+        if candidate_len <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = String::new();
+
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                lines.extend(split_long_word(word, width));
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    lines
+}
+
+fn split_long_word(value: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+
+    for ch in value.chars() {
+        current.push(ch);
+        if current.chars().count() >= width {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
 }
 
 fn format_memory(bytes: u64) -> String {
@@ -942,7 +1037,7 @@ mod tests {
 
     use super::{
         AppState, SearchMode, SortMode, allocate_flexible_widths, contains_match_score,
-        format_memory, format_ports_wrapped, fuzzy_match_score,
+        format_memory, format_ports_wrapped, fuzzy_match_score, wrap_cell_text,
     };
     use crate::process::ProcessRecord;
 
@@ -1055,5 +1150,11 @@ mod tests {
         state.select_all_filtered();
 
         assert!(state.selected.is_empty());
+    }
+
+    #[test]
+    fn cell_text_wraps_across_multiple_lines() {
+        assert_eq!(wrap_cell_text("Microsoft Edge WebView", 10), "Microsoft\nEdge\nWebView");
+        assert_eq!(wrap_cell_text("verylongtoken", 4), "very\nlong\ntoke\nn");
     }
 }
