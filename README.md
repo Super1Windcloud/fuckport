@@ -39,6 +39,8 @@ cargo build --release
 fuckport [OPTIONS] [TARGET]...
 ```
 ![img.png](img.png)
+---
+![img.png](cli.png)
 
 
 Targets:
