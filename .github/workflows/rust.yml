@@ -28,9 +28,28 @@ jobs:
   release:
     needs: test
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive_name: fuckport-linux-x86_64.tar.gz
+            binary_path: target/release/fuckport
+            binary_name: fuckport
+            archive_kind: tar
+          - os: windows-latest
+            archive_name: fuckport-windows-x86_64.zip
+            binary_path: target/release/fuckport.exe
+            binary_name: fuckport.exe
+            archive_kind: zip
+          - os: macos-latest
+            archive_name: fuckport-macos-arm64.tar.gz
+            binary_path: target/release/fuckport
+            binary_name: fuckport
+            archive_kind: tar
 
     steps:
       - uses: actions/checkout@v4
@@ -38,14 +57,27 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package artifact
-        shell: bash
+      - name: Stage artifact
         run: |
-          mkdir -p dist
-          cp "target/release/${BINARY_NAME}" "dist/${BINARY_NAME}-linux-x86_64"
+          mkdir dist
+          cp "${{ matrix.binary_path }}" "dist/${{ matrix.binary_name }}"
+        shell: bash
+
+      - name: Create tar.gz archive
+        if: matrix.archive_kind == 'tar'
+        run: |
+          tar -C dist -czf "${{ matrix.archive_name }}" "${{ matrix.binary_name }}"
+        shell: bash
+
+      - name: Create zip archive
+        if: matrix.archive_kind == 'zip'
+        run: |
+          cd dist
+          7z a "../${{ matrix.archive_name }}" "${{ matrix.binary_name }}"
+        shell: bash
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: ${{ matrix.archive_name }}
           generate_release_notes: true
