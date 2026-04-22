@@ -114,6 +114,10 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> bool {
             state.set_sort_mode(SortMode::Name);
             false
         }
+        KeyCode::Tab => {
+            state.toggle_search_mode();
+            false
+        }
         KeyCode::Up => {
             state.move_up();
             false
@@ -178,9 +182,10 @@ fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
 
 fn render_search(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let title = format!(
-        " Search {} ",
+        " Search [{}] {} ",
+        state.search_mode.label(),
         if state.query.is_empty() {
-            "(type for fuzzy search)"
+            "(Tab to switch)"
         } else {
             ""
         }
@@ -274,6 +279,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let total = state.filtered_records().len();
     let selected = state.selected.len();
     let sort = state.sort_mode.label();
+    let search = state.search_mode.label();
     let line = Line::from(vec![
         "F1".cyan().bold(),
         " CPU  ".dark_gray(),
@@ -283,11 +289,13 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         " Name  ".dark_gray(),
         "Space".cyan().bold(),
         " toggle  ".dark_gray(),
+        "Tab".cyan().bold(),
+        " search  ".dark_gray(),
         "Enter".green().bold(),
         " confirm  ".dark_gray(),
         "Esc".yellow().bold(),
         " cancel  ".dark_gray(),
-        format!("Sort {sort}  Showing {total}  Selected {selected}").white(),
+        format!("Sort {sort}  Search {search}  Showing {total}  Selected {selected}").white(),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -550,6 +558,7 @@ struct AppState {
     cursor: usize,
     query: String,
     sort_mode: SortMode,
+    search_mode: SearchMode,
     verbose: bool,
     cancelled: bool,
     table_state: TableState,
@@ -568,6 +577,7 @@ impl AppState {
             cursor: 0,
             query: String::new(),
             sort_mode: SortMode::Cpu,
+            search_mode: SearchMode::Contains,
             verbose,
             cancelled: false,
             table_state,
@@ -670,13 +680,20 @@ impl AppState {
         self.refresh_filter();
     }
 
+    fn toggle_search_mode(&mut self) {
+        self.search_mode = self.search_mode.toggle();
+        self.refresh_filter();
+    }
+
     fn refresh_filter(&mut self) {
         let mut matches = self
             .records
             .iter()
             .enumerate()
             .filter_map(|(index, record)| {
-                fuzzy_match_score(record, &self.query).map(|score| (index, score))
+                self.search_mode
+                    .match_score(record, &self.query)
+                    .map(|score| (index, score))
             })
             .collect::<Vec<_>>();
 
@@ -750,6 +767,66 @@ impl SortMode {
                 ),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum SearchMode {
+    Contains,
+    Fuzzy,
+}
+
+impl SearchMode {
+    fn label(self) -> &'static str {
+        match self {
+            SearchMode::Contains => "Contains",
+            SearchMode::Fuzzy => "Fuzzy",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            SearchMode::Contains => SearchMode::Fuzzy,
+            SearchMode::Fuzzy => SearchMode::Contains,
+        }
+    }
+
+    fn match_score(self, record: &ProcessRecord, query: &str) -> Option<i64> {
+        match self {
+            SearchMode::Contains => contains_match_score(record, query),
+            SearchMode::Fuzzy => fuzzy_match_score(record, query),
+        }
+    }
+}
+
+fn contains_match_score(record: &ProcessRecord, query: &str) -> Option<i64> {
+    if query.trim().is_empty() {
+        return Some(0);
+    }
+
+    let ports = format_ports_inline(&record.ports);
+    let pid = record.pid.as_u32().to_string();
+    let fields = [
+        record.app_name.as_str(),
+        record.name.as_str(),
+        record.cmd.as_str(),
+        ports.as_str(),
+        pid.as_str(),
+    ];
+    let query = query.to_lowercase();
+
+    fields
+        .into_iter()
+        .filter_map(|field| contains_score(field, &query))
+        .max()
+}
+
+fn contains_score(field: &str, query: &str) -> Option<i64> {
+    let haystack = field.to_lowercase();
+    haystack.find(query).map(|index| {
+        let len_bonus = (query.chars().count() as i64) * 8;
+        let start_bonus = 100_i64.saturating_sub(index as i64);
+        len_bonus + start_bonus
+    })
 }
 
 fn fuzzy_match_score(record: &ProcessRecord, query: &str) -> Option<i64> {
@@ -842,8 +919,8 @@ mod tests {
     use sysinfo::Pid;
 
     use super::{
-        AppState, SortMode, allocate_flexible_widths, format_memory, format_ports_wrapped,
-        fuzzy_match_score,
+        AppState, SearchMode, SortMode, allocate_flexible_widths, contains_match_score,
+        format_memory, format_ports_wrapped, fuzzy_match_score,
     };
     use crate::process::ProcessRecord;
 
@@ -866,6 +943,14 @@ mod tests {
         assert!(fuzzy_match_score(&record, "922").is_some());
         assert!(fuzzy_match_score(&record, "cexp").is_some());
         assert!(fuzzy_match_score(&record, "firefox").is_none());
+    }
+
+    #[test]
+    fn contains_filter_prefers_literal_substrings() {
+        let record = sample_record();
+        assert!(contains_match_score(&record, "chrome").is_some());
+        assert!(contains_match_score(&record, "922").is_some());
+        assert!(contains_match_score(&record, "chrm").is_none());
     }
 
     #[test]
@@ -892,6 +977,18 @@ mod tests {
     fn flexible_widths_expand_toward_targets() {
         let widths = allocate_flexible_widths(45, [(12, 18), (20, 30), (8, 14)]);
         assert_eq!(widths, (14, 22, 9));
+    }
+
+    #[test]
+    fn search_mode_toggles_between_contains_and_fuzzy() {
+        assert!(matches!(
+            SearchMode::Contains.toggle(),
+            SearchMode::Fuzzy
+        ));
+        assert!(matches!(
+            SearchMode::Fuzzy.toggle(),
+            SearchMode::Contains
+        ));
     }
 
     #[test]
