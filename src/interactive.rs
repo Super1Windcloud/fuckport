@@ -18,6 +18,18 @@ use sysinfo::Pid;
 use crate::error::AppResult;
 use crate::process::{ProcessCatalog, ProcessRecord};
 
+const TABLE_COLUMN_SPACING: u16 = 1;
+const SEL_WIDTH: u16 = 5;
+const PID_WIDTH: u16 = 7;
+const CPU_WIDTH: u16 = 8;
+const MEMORY_WIDTH: u16 = 10;
+const APP_MIN_WIDTH: u16 = 12;
+const APP_MAX_WIDTH: u16 = 22;
+const PROCESS_MIN_WIDTH: u16 = 20;
+const PROCESS_MAX_WIDTH: u16 = 42;
+const PORTS_MIN_WIDTH: u16 = 8;
+const PORTS_MAX_WIDTH: u16 = 18;
+
 pub fn pick_interactive(catalog: &ProcessCatalog, verbose: bool) -> AppResult<BTreeSet<Pid>> {
     let records = catalog.process_records();
     if records.is_empty() {
@@ -201,6 +213,7 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     .height(1);
 
     let filtered_records = state.filtered_records();
+    let widths = compute_table_widths(&filtered_records, state.verbose, area.width);
     let rows = filtered_records.into_iter().map(|record| {
         let selected = if state.is_selected(record.pid) {
             "[x]"
@@ -233,16 +246,9 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 
     let table = Table::new(
         rows,
-        [
-            Constraint::Length(5),
-            Constraint::Length(7),
-            Constraint::Length(18),
-            Constraint::Fill(3),
-            Constraint::Length(8),
-            Constraint::Length(10),
-            Constraint::Fill(2),
-        ],
+        widths,
     )
+    .column_spacing(TABLE_COLUMN_SPACING)
     .header(header)
     .row_highlight_style(
         Style::default()
@@ -393,6 +399,111 @@ fn format_ports_wrapped(ports: &BTreeSet<u16>) -> String {
         .map(|chunk| chunk.join(","))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn compute_table_widths(
+    records: &[&ProcessRecord],
+    verbose: bool,
+    total_width: u16,
+) -> [Constraint; 7] {
+    let reserved = SEL_WIDTH + PID_WIDTH + CPU_WIDTH + MEMORY_WIDTH + 2;
+    let spacing = TABLE_COLUMN_SPACING * 6;
+    let flexible = total_width.saturating_sub(reserved + spacing);
+
+    let app_target = content_width(
+        records.iter().map(|record| record.app_name.chars().count()),
+        APP_MIN_WIDTH,
+        APP_MAX_WIDTH,
+    );
+    let process_target = content_width(
+        records.iter().map(|record| {
+            if verbose && !record.cmd.is_empty() {
+                format!("{} | {}", record.name, truncate(&record.cmd, 48))
+                    .chars()
+                    .count()
+            } else {
+                record.name.chars().count()
+            }
+        }),
+        PROCESS_MIN_WIDTH,
+        PROCESS_MAX_WIDTH,
+    );
+    let ports_target = content_width(
+        records
+            .iter()
+            .map(|record| longest_line_width(&format_ports_wrapped(&record.ports))),
+        PORTS_MIN_WIDTH,
+        PORTS_MAX_WIDTH,
+    );
+
+    let (app_width, process_width, ports_width) = allocate_flexible_widths(
+        flexible,
+        [
+            (APP_MIN_WIDTH, app_target),
+            (PROCESS_MIN_WIDTH, process_target),
+            (PORTS_MIN_WIDTH, ports_target),
+        ],
+    );
+
+    [
+        Constraint::Length(SEL_WIDTH),
+        Constraint::Length(PID_WIDTH),
+        Constraint::Length(app_width),
+        Constraint::Length(process_width),
+        Constraint::Length(CPU_WIDTH),
+        Constraint::Length(MEMORY_WIDTH),
+        Constraint::Length(ports_width),
+    ]
+}
+
+fn content_width<I>(lengths: I, min_width: u16, max_width: u16) -> u16
+where
+    I: Iterator<Item = usize>,
+{
+    let width = lengths.max().unwrap_or(min_width as usize) as u16;
+    width.clamp(min_width, max_width)
+}
+
+fn longest_line_width(value: &str) -> usize {
+    value.lines().map(|line| line.chars().count()).max().unwrap_or(0)
+}
+
+fn allocate_flexible_widths(total: u16, specs: [(u16, u16); 3]) -> (u16, u16, u16) {
+    let min_total = specs.iter().map(|(min, _)| *min).sum::<u16>();
+    if total <= min_total {
+        return (specs[0].0, specs[1].0, specs[2].0);
+    }
+
+    let mut widths = [specs[0].0, specs[1].0, specs[2].0];
+    let targets = [specs[0].1, specs[1].1, specs[2].1];
+    let mut remaining = total - min_total;
+
+    loop {
+        let mut changed = false;
+
+        for index in 0..widths.len() {
+            if remaining == 0 {
+                break;
+            }
+
+            if widths[index] < targets[index] {
+                widths[index] += 1;
+                remaining -= 1;
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    while remaining > 0 {
+        widths[1] += 1;
+        remaining -= 1;
+    }
+
+    (widths[0], widths[1], widths[2])
 }
 
 fn format_memory(bytes: u64) -> String {
@@ -731,7 +842,8 @@ mod tests {
     use sysinfo::Pid;
 
     use super::{
-        AppState, SortMode, format_memory, format_ports_wrapped, fuzzy_match_score,
+        AppState, SortMode, allocate_flexible_widths, format_memory, format_ports_wrapped,
+        fuzzy_match_score,
     };
     use crate::process::ProcessRecord;
 
@@ -774,6 +886,12 @@ mod tests {
     fn wrapped_ports_break_after_every_two_entries() {
         let ports = BTreeSet::from([3000, 3001, 3002]);
         assert_eq!(format_ports_wrapped(&ports), ":3000,:3001\n:3002");
+    }
+
+    #[test]
+    fn flexible_widths_expand_toward_targets() {
+        let widths = allocate_flexible_widths(45, [(12, 18), (20, 30), (8, 14)]);
+        assert_eq!(widths, (14, 22, 9));
     }
 
     #[test]
