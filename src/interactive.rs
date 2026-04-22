@@ -216,6 +216,8 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 
         let cpu_style = cpu_style(record.cpu_usage);
         let mem_style = memory_style(record.memory_bytes);
+        let wrapped_ports = format_ports_wrapped(&record.ports);
+        let port_lines = wrapped_ports.lines().count().max(1) as u16;
 
         Row::new([
             Cell::from(selected),
@@ -224,8 +226,9 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
             Cell::from(truncate(&process_name, 42)),
             Cell::from(format!("{:>5.1}%", record.cpu_usage)).style(cpu_style),
             Cell::from(format_memory(record.memory_bytes)).style(mem_style),
-            Cell::from(format_ports(&record.ports)),
+            Cell::from(wrapped_ports),
         ])
+        .height(port_lines)
     });
 
     let table = Table::new(
@@ -291,7 +294,7 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
     let content = match state.current_record() {
         Some(record) => {
-            let ports = format_ports(&record.ports);
+            let ports = format_ports_inline(&record.ports);
             let line1 = Line::from(vec![
                 "App ".dark_gray(),
                 record.app_name.as_str().white().bold(),
@@ -363,7 +366,7 @@ fn memory_color(memory: u64) -> Color {
     }
 }
 
-fn format_ports(ports: &BTreeSet<u16>) -> String {
+fn format_ports_inline(ports: &BTreeSet<u16>) -> String {
     if ports.is_empty() {
         return "-".to_string();
     }
@@ -374,6 +377,22 @@ fn format_ports(ports: &BTreeSet<u16>) -> String {
         .map(|port| format!(":{port}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+fn format_ports_wrapped(ports: &BTreeSet<u16>) -> String {
+    if ports.is_empty() {
+        return "-".to_string();
+    }
+
+    ports
+        .iter()
+        .take(4)
+        .map(|port| format!(":{port}"))
+        .collect::<Vec<_>>()
+        .chunks(2)
+        .map(|chunk| chunk.join(","))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn format_memory(bytes: u64) -> String {
@@ -627,7 +646,7 @@ fn fuzzy_match_score(record: &ProcessRecord, query: &str) -> Option<i64> {
         return Some(0);
     }
 
-    let ports = format_ports(&record.ports);
+    let ports = format_ports_inline(&record.ports);
     let fields = [
         record.app_name.as_str(),
         record.name.as_str(),
@@ -711,7 +730,9 @@ mod tests {
 
     use sysinfo::Pid;
 
-    use super::{AppState, SortMode, format_memory, fuzzy_match_score};
+    use super::{
+        AppState, SortMode, format_memory, format_ports_wrapped, fuzzy_match_score,
+    };
     use crate::process::ProcessRecord;
 
     fn sample_record() -> ProcessRecord {
@@ -747,6 +768,12 @@ mod tests {
     fn memory_format_uses_human_units() {
         assert_eq!(format_memory(1024), "1.0K");
         assert_eq!(format_memory(1024 * 1024), "1.0M");
+    }
+
+    #[test]
+    fn wrapped_ports_break_after_every_two_entries() {
+        let ports = BTreeSet::from([3000, 3001, 3002]);
+        assert_eq!(format_ports_wrapped(&ports), ":3000,:3001\n:3002");
     }
 
     #[test]
