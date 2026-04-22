@@ -666,11 +666,19 @@ impl AppState {
     }
 
     fn select_all_filtered(&mut self) {
-        self.selected.extend(
-            self.filtered_indexes
-                .iter()
-                .map(|index| self.records[*index].pid),
-        );
+        let filtered = self
+            .filtered_indexes
+            .iter()
+            .map(|index| self.records[*index].pid)
+            .collect::<Vec<_>>();
+
+        if filtered.iter().all(|pid| self.selected.contains(pid)) {
+            for pid in filtered {
+                self.selected.remove(&pid);
+            }
+        } else {
+            self.selected.extend(filtered);
+        }
     }
 
     fn current_pid(&self) -> Option<Pid> {
@@ -1037,5 +1045,15 @@ mod tests {
 
         assert_eq!(state.selected.len(), 1);
         assert!(state.selected.contains(&Pid::from_u32(42)));
+    }
+
+    #[test]
+    fn ctrl_a_toggles_off_when_all_filtered_records_are_selected() {
+        let records = vec![sample_record()];
+        let mut state = AppState::new(records, false);
+        state.select_all_filtered();
+        state.select_all_filtered();
+
+        assert!(state.selected.is_empty());
     }
 }
