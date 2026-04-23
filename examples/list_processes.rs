@@ -1,6 +1,7 @@
+use fuckport::error::AppResult;
 use fuckport::process::ProcessCatalog;
 
-fn main() -> Result<(), String> {
+fn main() -> AppResult<()> {
     let catalog = ProcessCatalog::load()?;
 
     for record in catalog.process_records().into_iter().take(10) {

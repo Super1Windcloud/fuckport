@@ -1,6 +1,6 @@
 [package]
 name = "fuckport"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.85"
 description = "A CLI for killing processes by PID, name, or port."
@@ -19,7 +19,7 @@ name = "fuckport"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.100"
+anyhow = { version = "1.0.100", features = ["backtrace"] }
 clap = { version = "4.5.39", features = ["derive"] }
 crossterm = "0.29.0"
 netstat2 = "0.11.2"
