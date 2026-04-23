@@ -8,8 +8,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::thread;
 
+use anyhow::{Context, bail};
 use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, get_sockets_info};
-use sysinfo::{MINIMUM_CPU_UPDATE_INTERVAL, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+use sysinfo::{
+    MINIMUM_CPU_UPDATE_INTERVAL, Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
+};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
@@ -44,7 +47,8 @@ impl ProcessCatalog {
         let pids_by_port = port_map()?;
         let ports_by_pid = reverse_port_map(&pids_by_port);
         let current_pid = sysinfo::get_current_pid()
-            .map_err(|error| format!("failed to read current pid: {error}"))?;
+            .map_err(anyhow::Error::msg)
+            .context("failed to read current pid")?;
 
         Ok(Self {
             system,
@@ -126,7 +130,7 @@ impl ProcessCatalog {
         matches.remove(&self.current_pid);
 
         if matches.is_empty() {
-            return Err("no matching processes found".to_string());
+            bail!("no matching processes found");
         }
 
         Ok(matches)
@@ -226,7 +230,12 @@ fn windows_file_description(path: &Path) -> Option<String> {
 
     let mut buffer = vec![0_u8; size as usize];
     let loaded = unsafe {
-        GetFileVersionInfoW(wide_path.as_ptr(), 0, size, buffer.as_mut_ptr().cast::<c_void>())
+        GetFileVersionInfoW(
+            wide_path.as_ptr(),
+            0,
+            size,
+            buffer.as_mut_ptr().cast::<c_void>(),
+        )
     };
     if loaded == 0 {
         return None;
@@ -263,13 +272,17 @@ fn version_translation_queries(buffer: &[u8]) -> Vec<Vec<u16>> {
         return Vec::new();
     }
 
-    let translations = unsafe {
-        std::slice::from_raw_parts(pointer.cast::<u16>(), (length as usize) / 2)
-    };
+    let translations =
+        unsafe { std::slice::from_raw_parts(pointer.cast::<u16>(), (length as usize) / 2) };
 
     translations
         .chunks_exact(2)
-        .map(|chunk| format!(r"\StringFileInfo\{:04x}{:04x}\FileDescription", chunk[0], chunk[1]))
+        .map(|chunk| {
+            format!(
+                r"\StringFileInfo\{:04x}{:04x}\FileDescription",
+                chunk[0], chunk[1]
+            )
+        })
         .map(|query| wide_query(&query))
         .collect()
 }
@@ -309,7 +322,7 @@ fn port_map() -> AppResult<BTreeMap<u16, BTreeSet<Pid>>> {
         AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6,
         ProtocolFlags::TCP | ProtocolFlags::UDP,
     )
-    .map_err(|error| format!("failed to enumerate sockets: {error}"))?;
+    .context("failed to enumerate sockets")?;
 
     let mut result = BTreeMap::<u16, BTreeSet<Pid>>::new();
     for socket in sockets {

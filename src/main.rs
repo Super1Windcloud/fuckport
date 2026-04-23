@@ -1,3 +1,5 @@
+use std::backtrace::BacktraceStatus;
+
 use clap::Parser;
 
 use fuckport::cli::Cli;
@@ -11,7 +13,7 @@ fn main() {
     let cli = Cli::parse();
 
     if let Err(error) = run(cli) {
-        eprintln!("Error: {error}");
+        report_error(&error);
         std::process::exit(1);
     }
 }
@@ -39,4 +41,22 @@ fn run(cli: Cli) -> AppResult<()> {
     };
 
     kill_processes(&mut catalog, &selected_pids, &options)
+}
+
+fn report_error(error: &anyhow::Error) {
+    eprintln!("Error: {error}");
+
+    for cause in error.chain().skip(1) {
+        eprintln!("Caused by: {cause}");
+    }
+
+    let backtrace = error.backtrace();
+    if matches!(
+        backtrace.status(),
+        BacktraceStatus::Captured | BacktraceStatus::Disabled
+    ) {
+        if backtrace.status() == BacktraceStatus::Captured {
+            eprintln!("\nBacktrace:\n{backtrace}");
+        }
+    }
 }

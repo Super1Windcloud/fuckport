@@ -1,1 +1,1 @@
-pub type AppResult<T> = Result<T, String>;
+pub type AppResult<T> = anyhow::Result<T>;

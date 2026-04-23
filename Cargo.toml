@@ -19,6 +19,7 @@ name = "fuckport"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0.100"
 clap = { version = "4.5.39", features = ["derive"] }
 crossterm = "0.29.0"
 netstat2 = "0.11.2"
@@ -28,3 +29,14 @@ unicode-width = "0.2.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
+
+[profile.dev]
+debug = 0
+
+#最快编译时间
+[profile.release]
+lto = false
+codegen-units = 256
+panic = "abort"
+debug = 0

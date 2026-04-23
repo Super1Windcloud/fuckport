@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::time::Duration;
 
+use anyhow::Context;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -37,10 +38,9 @@ pub fn pick_interactive(catalog: &ProcessCatalog, verbose: bool) -> AppResult<BT
         return Ok(BTreeSet::new());
     }
 
-    let mut terminal =
-        init_terminal().map_err(|error| format!("interactive mode failed: {error}"))?;
+    let mut terminal = init_terminal().context("interactive mode failed")?;
     let result = run_app(&mut terminal, records, verbose);
-    restore_terminal(terminal).map_err(|error| format!("failed to restore terminal: {error}"))?;
+    restore_terminal(terminal).context("failed to restore terminal")?;
 
     result.map(|state| state.selected_pids().into_iter().collect::<BTreeSet<_>>())
 }
@@ -56,12 +56,10 @@ fn run_app(
     loop {
         terminal
             .draw(|frame| draw(frame, &mut state))
-            .map_err(|error| format!("failed to draw interactive UI: {error}"))?;
+            .context("failed to draw interactive UI")?;
 
-        if event::poll(Duration::from_millis(200))
-            .map_err(|error| format!("failed to read terminal events: {error}"))?
-            && let Event::Key(key) =
-                event::read().map_err(|error| format!("failed to read key event: {error}"))?
+        if event::poll(Duration::from_millis(200)).context("failed to read terminal events")?
+            && let Event::Key(key) = event::read().context("failed to read key event")?
             && handle_key_event(&mut state, key)
         {
             return Ok(state);
@@ -84,10 +82,8 @@ fn restore_terminal(mut terminal: DefaultTerminal) -> io::Result<()> {
 }
 
 fn drain_pending_events() -> AppResult<()> {
-    while event::poll(Duration::from_millis(0))
-        .map_err(|error| format!("failed to drain terminal events: {error}"))?
-    {
-        let _ = event::read().map_err(|error| format!("failed to read terminal event: {error}"))?;
+    while event::poll(Duration::from_millis(0)).context("failed to drain terminal events")? {
+        let _ = event::read().context("failed to read terminal event")?;
     }
     Ok(())
 }
@@ -263,23 +259,20 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         .height(row_lines)
     });
 
-    let table = Table::new(
-        rows,
-        widths,
-    )
-    .column_spacing(TABLE_COLUMN_SPACING)
-    .header(header)
-    .row_highlight_style(
-        Style::default()
-            .bg(Color::Rgb(24, 34, 54))
-            .add_modifier(Modifier::BOLD),
-    )
-    .block(
-        Block::default()
-            .title(" Processes ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Blue)),
-    );
+    let table = Table::new(rows, widths)
+        .column_spacing(TABLE_COLUMN_SPACING)
+        .header(header)
+        .row_highlight_style(
+            Style::default()
+                .bg(Color::Rgb(24, 34, 54))
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(
+            Block::default()
+                .title(" Processes ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Blue)),
+        );
 
     frame.render_stateful_widget(table, area, &mut state.table_state);
 
@@ -435,14 +428,18 @@ fn compute_table_widths(
     let flexible = total_width.saturating_sub(reserved + spacing);
 
     let app_target = content_width(
-        records.iter().map(|record| UnicodeWidthStr::width(record.app_name.as_str())),
+        records
+            .iter()
+            .map(|record| UnicodeWidthStr::width(record.app_name.as_str())),
         APP_MIN_WIDTH,
         APP_MAX_WIDTH,
     );
     let process_target = content_width(
         records.iter().map(|record| {
             if verbose && !record.cmd.is_empty() {
-                UnicodeWidthStr::width(format!("{} | {}", record.name, truncate(&record.cmd, 48)).as_str())
+                UnicodeWidthStr::width(
+                    format!("{} | {}", record.name, truncate(&record.cmd, 48)).as_str(),
+                )
             } else {
                 UnicodeWidthStr::width(record.name.as_str())
             }
@@ -487,11 +484,7 @@ where
 }
 
 fn longest_line_width(value: &str) -> usize {
-    value
-        .lines()
-        .map(UnicodeWidthStr::width)
-        .max()
-        .unwrap_or(0)
+    value.lines().map(UnicodeWidthStr::width).max().unwrap_or(0)
 }
 
 fn allocate_flexible_widths(total: u16, specs: [(u16, u16); 3]) -> (u16, u16, u16) {
@@ -1111,14 +1104,8 @@ mod tests {
 
     #[test]
     fn search_mode_toggles_between_contains_and_fuzzy() {
-        assert!(matches!(
-            SearchMode::Contains.toggle(),
-            SearchMode::Fuzzy
-        ));
-        assert!(matches!(
-            SearchMode::Fuzzy.toggle(),
-            SearchMode::Contains
-        ));
+        assert!(matches!(SearchMode::Contains.toggle(), SearchMode::Fuzzy));
+        assert!(matches!(SearchMode::Fuzzy.toggle(), SearchMode::Contains));
     }
 
     #[test]
@@ -1167,7 +1154,10 @@ mod tests {
 
     #[test]
     fn cell_text_wraps_across_multiple_lines() {
-        assert_eq!(wrap_cell_text("Microsoft Edge WebView", 10), "Microsoft\nEdge\nWebView");
+        assert_eq!(
+            wrap_cell_text("Microsoft Edge WebView", 10),
+            "Microsoft\nEdge\nWebView"
+        );
         assert_eq!(wrap_cell_text("verylongtoken", 4), "very\nlong\ntoke\nn");
     }
 }

@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::thread;
 use std::time::Duration;
 
+use anyhow::bail;
 use sysinfo::Pid;
 #[cfg(unix)]
 use sysinfo::Signal;
@@ -22,7 +23,7 @@ pub fn kill_processes(
     options: &KillOptions,
 ) -> AppResult<()> {
     if pids.is_empty() {
-        return Err("no matching processes found".to_string());
+        bail!("no matching processes found");
     }
 
     let mut failed = Vec::new();
@@ -84,7 +85,7 @@ pub fn kill_processes(
     }
 
     if !failed.is_empty() {
-        return Err(format!("failed to kill: {}", failed.join(", ")));
+        bail!("failed to kill: {}", failed.join(", "));
     }
 
     if !warnings.is_empty() && !options.silent {
