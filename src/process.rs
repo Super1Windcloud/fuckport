@@ -231,7 +231,7 @@ fn app_name_for_process(process: &sysinfo::Process) -> String {
     String::from("<unknown>")
 }
 
-fn file_name_value(path: &std::path::Path) -> Option<String> {
+fn file_name_value(path: &Path) -> Option<String> {
     if let Some(name) = path.file_name() {
         let value = name.to_string_lossy().trim().to_string();
         if !value.is_empty() {
