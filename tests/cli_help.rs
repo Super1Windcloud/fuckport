@@ -12,4 +12,5 @@ fn help_mentions_timeout_options() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--force-after-timeout"));
     assert!(stdout.contains("--wait-for-exit"));
+    assert!(stdout.contains("--directory"));
 }

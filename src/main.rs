@@ -20,12 +20,18 @@ fn main() {
 
 fn run(cli: Cli) -> AppResult<()> {
     let mut catalog = ProcessCatalog::load()?;
-    let interactive_mode = cli.interactive || cli.targets.is_empty();
+    let interactive_mode = should_use_interactive(&cli);
 
     let selected_pids = if interactive_mode {
         pick_interactive(&catalog, cli.verbose)?
     } else {
-        let targets = parse_targets(&cli.targets);
+        let mut targets = parse_targets(&cli.targets);
+        targets.extend(
+            cli.directories
+                .iter()
+                .cloned()
+                .map(fuckport::input::Target::Directory),
+        );
         catalog.resolve_targets(&targets, cli.case_sensitive)?
     };
 
@@ -43,6 +49,10 @@ fn run(cli: Cli) -> AppResult<()> {
     kill_processes(&mut catalog, &selected_pids, &options)
 }
 
+fn should_use_interactive(cli: &Cli) -> bool {
+    cli.interactive || (cli.targets.is_empty() && cli.directories.is_empty())
+}
+
 fn report_error(error: &anyhow::Error) {
     eprintln!("Error: {error}");
 
@@ -54,9 +64,54 @@ fn report_error(error: &anyhow::Error) {
     if matches!(
         backtrace.status(),
         BacktraceStatus::Captured | BacktraceStatus::Disabled
-    ) {
-        if backtrace.status() == BacktraceStatus::Captured {
-            eprintln!("\nBacktrace:\n{backtrace}");
+    ) && backtrace.status() == BacktraceStatus::Captured
+    {
+        eprintln!("\nBacktrace:\n{backtrace}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use fuckport::cli::Cli;
+
+    use super::should_use_interactive;
+
+    fn cli(targets: Vec<String>, directories: Vec<PathBuf>, interactive: bool) -> Cli {
+        Cli {
+            targets,
+            force: false,
+            case_sensitive: false,
+            directories,
+            silent: false,
+            verbose: false,
+            interactive,
+            force_after_timeout: 1_500,
+            wait_for_exit: 5_000,
         }
+    }
+
+    #[test]
+    fn defaults_to_interactive_without_targets_or_directories() {
+        assert!(should_use_interactive(&cli(Vec::new(), Vec::new(), false)));
+    }
+
+    #[test]
+    fn directory_target_disables_default_interactive_mode() {
+        assert!(!should_use_interactive(&cli(
+            Vec::new(),
+            vec![PathBuf::from(".")],
+            false,
+        )));
+    }
+
+    #[test]
+    fn explicit_interactive_overrides_directory_targets() {
+        assert!(should_use_interactive(&cli(
+            Vec::new(),
+            vec![PathBuf::from(".")],
+            true,
+        )));
     }
 }

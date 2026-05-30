@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use sysinfo::Pid;
 
 #[derive(Clone, Debug)]
@@ -5,6 +7,7 @@ pub enum Target {
     Pid(Pid),
     Port(u16),
     Name(String),
+    Directory(PathBuf),
 }
 
 pub fn parse_targets(input: &[String]) -> Vec<Target> {

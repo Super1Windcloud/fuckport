@@ -11,6 +11,7 @@
 - Kill by PID: `fuckport 1234`
 - Kill by process name: `fuckport chrome`
 - Kill by port: `fuckport :3000`
+- Kill by working directory: `fuckport --directory ./project`
 - Kill multiple targets in one run
 - Interactive picker when no target is provided
 - Graceful shutdown first, with automatic fallback to force kill
@@ -53,6 +54,7 @@ Options:
 
 - `-f, --force`: force kill immediately
 - `-c, --case-sensitive`: enable case-sensitive name matching
+- `-d, --directory <DIR>`: kill processes whose current working directory is `DIR` or below it
 - `-i, --interactive`: open the interactive selector
 - `-s, --silent`: suppress success output
 - `-v, --verbose`: show more detail in interactive mode
@@ -79,10 +81,16 @@ Kill whatever is listening on a port:
 fuckport :8080
 ```
 
+Kill processes using a project directory as their current working directory:
+
+```bash
+fuckport --directory ./project
+```
+
 Kill multiple targets in one command:
 
 ```bash
-fuckport 1337 safari :8080
+fuckport 1337 safari :8080 --directory ./project
 ```
 
 Run without arguments to open the interactive interface:

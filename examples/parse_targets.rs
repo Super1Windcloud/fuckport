@@ -8,6 +8,7 @@ fn main() {
             Target::Pid(pid) => println!("pid {}", pid.as_u32()),
             Target::Port(port) => println!("port {port}"),
             Target::Name(name) => println!("name {name}"),
+            Target::Directory(path) => println!("directory {}", path.display()),
         }
     }
 }

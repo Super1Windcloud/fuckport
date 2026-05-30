@@ -2,6 +2,7 @@ use clap::{
     ArgAction, Parser,
     builder::styling::{AnsiColor, Effects, Styles},
 };
+use std::path::PathBuf;
 
 fn help_styles() -> Styles {
     Styles::styled()
@@ -34,6 +35,10 @@ pub struct Cli {
     /// Case-sensitive name matching
     #[arg(short = 'c', long, action = ArgAction::SetTrue)]
     pub case_sensitive: bool,
+
+    /// Kill processes whose current working directory is this directory or below it
+    #[arg(short = 'd', long = "directory", value_name = "DIR")]
+    pub directories: Vec<PathBuf>,
 
     /// Suppress per-process success output
     #[arg(short, long, action = ArgAction::SetTrue)]

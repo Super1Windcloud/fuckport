@@ -6,6 +6,7 @@ use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::path::Path;
+use std::path::{Path as StdPath, PathBuf};
 use std::thread;
 
 use anyhow::{Context, bail};
@@ -124,6 +125,9 @@ impl ProcessCatalog {
                 Target::Name(name) => {
                     matches.extend(self.match_by_name(name, case_sensitive));
                 }
+                Target::Directory(directory) => {
+                    matches.extend(self.match_by_directory(directory)?);
+                }
             }
         }
 
@@ -155,6 +159,28 @@ impl ProcessCatalog {
             })
             .collect()
     }
+
+    fn match_by_directory(&self, directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
+        let directory = canonical_directory(directory)?;
+
+        Ok(self
+            .system
+            .processes()
+            .values()
+            .filter_map(|process| {
+                if process.pid() == self.current_pid {
+                    return None;
+                }
+
+                let cwd = process.cwd()?;
+                if cwd_matches_directory(cwd, &directory) {
+                    Some(process.pid())
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
 }
 
 fn refresh_processes(system: &mut System) {
@@ -163,6 +189,7 @@ fn refresh_processes(system: &mut System) {
         true,
         ProcessRefreshKind::nothing()
             .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_cwd(UpdateKind::OnlyIfNotSet)
             .with_cpu(),
     );
     thread::sleep(MINIMUM_CPU_UPDATE_INTERVAL);
@@ -171,6 +198,7 @@ fn refresh_processes(system: &mut System) {
         true,
         ProcessRefreshKind::nothing()
             .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_cwd(UpdateKind::OnlyIfNotSet)
             .with_cpu(),
     );
 }
@@ -370,9 +398,29 @@ fn name_matches(name: &str, cmd: &str, needle: &str, case_sensitive: bool) -> bo
     haystack_name.contains(&query) || haystack_cmd.contains(&query)
 }
 
+fn canonical_directory(directory: &StdPath) -> AppResult<PathBuf> {
+    let path = directory
+        .canonicalize()
+        .with_context(|| format!("failed to resolve directory {}", directory.display()))?;
+
+    if !path.is_dir() {
+        bail!("{} is not a directory", directory.display());
+    }
+
+    Ok(path)
+}
+
+fn cwd_matches_directory(cwd: &StdPath, directory: &StdPath) -> bool {
+    cwd.canonicalize()
+        .map(|cwd| cwd == directory || cwd.starts_with(directory))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::name_matches;
+    use std::fs;
+
+    use super::{cwd_matches_directory, name_matches};
 
     #[test]
     fn name_matching_is_case_insensitive_by_default() {
@@ -399,5 +447,35 @@ mod tests {
             "http.server",
             false
         ));
+    }
+
+    #[test]
+    fn directory_matching_includes_descendants() {
+        let root =
+            std::env::temp_dir().join(format!("fuckport-directory-test-{}", std::process::id()));
+        let child = root.join("child");
+        fs::create_dir_all(&child).expect("failed to create test directory");
+
+        let root = root.canonicalize().expect("failed to canonicalize root");
+        assert!(cwd_matches_directory(&child, &root));
+
+        fs::remove_dir_all(&root).expect("failed to clean test directory");
+    }
+
+    #[test]
+    fn directory_matching_excludes_siblings() {
+        let base = std::env::temp_dir().join(format!(
+            "fuckport-directory-sibling-test-{}",
+            std::process::id()
+        ));
+        let root = base.join("root");
+        let sibling = base.join("root-sibling");
+        fs::create_dir_all(&root).expect("failed to create root directory");
+        fs::create_dir_all(&sibling).expect("failed to create sibling directory");
+
+        let root = root.canonicalize().expect("failed to canonicalize root");
+        assert!(!cwd_matches_directory(&sibling, &root));
+
+        fs::remove_dir_all(&base).expect("failed to clean test directory");
     }
 }
