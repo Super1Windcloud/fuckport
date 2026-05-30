@@ -3,6 +3,8 @@ use std::ffi::OsString;
 #[cfg(windows)]
 use std::ffi::c_void;
 #[cfg(windows)]
+use std::mem::size_of;
+#[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::path::Path;
@@ -16,8 +18,44 @@ use sysinfo::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    FILE_NAME_NORMALIZED, FILE_TYPE_DISK, GetFileType, GetFileVersionInfoSizeW,
+    GetFileVersionInfoW, GetFinalPathNameByHandleW, VOLUME_NAME_DOS, VerQueryValueW,
 };
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, STATUS_INFO_LENGTH_MISMATCH,
+        STATUS_SUCCESS,
+    },
+    System::Threading::{GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE},
+};
+
+#[cfg(windows)]
+const SYSTEM_EXTENDED_HANDLE_INFORMATION: u32 = 64;
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn NtQuerySystemInformation(
+        system_information_class: u32,
+        system_information: *mut c_void,
+        system_information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SystemHandleTableEntryInfoEx {
+    object: *mut c_void,
+    unique_process_id: usize,
+    handle_value: usize,
+    granted_access: u32,
+    creator_back_trace_index: u16,
+    object_type_index: u16,
+    handle_attributes: u32,
+    reserved: u32,
+}
 
 use crate::error::AppResult;
 use crate::input::Target;
@@ -162,9 +200,13 @@ impl ProcessCatalog {
 
     fn match_by_directory(&self, directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
         let directory = canonical_directory(directory)?;
+        let mut matches = directory_handle_owners(&directory)?;
+        matches.extend(self.match_by_cwd(&directory));
+        Ok(matches)
+    }
 
-        Ok(self
-            .system
+    fn match_by_cwd(&self, directory: &StdPath) -> BTreeSet<Pid> {
+        self.system
             .processes()
             .values()
             .filter_map(|process| {
@@ -173,13 +215,13 @@ impl ProcessCatalog {
                 }
 
                 let cwd = process.cwd()?;
-                if cwd_matches_directory(cwd, &directory) {
+                if cwd_matches_directory(cwd, directory) {
                     Some(process.pid())
                 } else {
                     None
                 }
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -414,6 +456,207 @@ fn cwd_matches_directory(cwd: &StdPath, directory: &StdPath) -> bool {
     cwd.canonicalize()
         .map(|cwd| cwd == directory || cwd.starts_with(directory))
         .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn directory_handle_owners(directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
+    let mut matches = BTreeSet::new();
+
+    for handle in system_handles()? {
+        let process_id = handle.unique_process_id as u32;
+        if process_id == 0 {
+            continue;
+        }
+
+        if let Some(path) = duplicated_handle_path(process_id, handle.handle_value) {
+            if path_matches_directory(&path, directory) {
+                matches.insert(Pid::from_u32(process_id));
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
+#[cfg(not(windows))]
+fn directory_handle_owners(_directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
+    Ok(BTreeSet::new())
+}
+
+#[cfg(windows)]
+fn system_handles() -> AppResult<Vec<SystemHandleTableEntryInfoEx>> {
+    let mut buffer = vec![0_u8; 1024 * 1024];
+
+    loop {
+        let mut return_length = 0_u32;
+        let status = unsafe {
+            NtQuerySystemInformation(
+                SYSTEM_EXTENDED_HANDLE_INFORMATION,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                buffer.len() as u32,
+                &mut return_length,
+            )
+        };
+
+        if status == STATUS_SUCCESS {
+            break;
+        }
+
+        if status != STATUS_INFO_LENGTH_MISMATCH {
+            bail!("NtQuerySystemInformation failed with NTSTATUS {status:#x}");
+        }
+
+        let next_len = (return_length as usize).max(buffer.len().saturating_mul(2));
+        if next_len > 256 * 1024 * 1024 {
+            bail!("system handle table is too large to scan");
+        }
+        buffer.resize(next_len, 0);
+    }
+
+    let handle_count = usize::from_ne_bytes(
+        buffer[..size_of::<usize>()]
+            .try_into()
+            .expect("usize slice size is fixed"),
+    );
+    let entries_offset = size_of::<usize>() * 2;
+    let entries_size = handle_count
+        .checked_mul(size_of::<SystemHandleTableEntryInfoEx>())
+        .context("system handle table size overflow")?;
+
+    if buffer.len() < entries_offset + entries_size {
+        bail!("system handle table response was truncated");
+    }
+
+    let entries = unsafe {
+        std::slice::from_raw_parts(
+            buffer.as_ptr().add(entries_offset) as *const SystemHandleTableEntryInfoEx,
+            handle_count,
+        )
+    };
+
+    Ok(entries.to_vec())
+}
+
+#[cfg(windows)]
+fn duplicated_handle_path(process_id: u32, handle_value: usize) -> Option<PathBuf> {
+    let source_process = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, process_id) };
+    let source_process = OwnedHandle::new(source_process)?;
+
+    let mut duplicated = std::ptr::null_mut::<c_void>();
+    let duplicated_ok = unsafe {
+        DuplicateHandle(
+            source_process.raw(),
+            handle_value as HANDLE,
+            GetCurrentProcess(),
+            &mut duplicated,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if duplicated_ok == 0 {
+        return None;
+    }
+
+    let duplicated = OwnedHandle::new(duplicated)?;
+    let file_type = unsafe { GetFileType(duplicated.raw()) };
+    if file_type != FILE_TYPE_DISK {
+        return None;
+    }
+
+    final_path_name(duplicated.raw())
+}
+
+#[cfg(windows)]
+struct OwnedHandle {
+    handle: HANDLE,
+}
+
+#[cfg(windows)]
+impl OwnedHandle {
+    fn new(handle: HANDLE) -> Option<Self> {
+        if handle.is_null() {
+            None
+        } else {
+            Some(Self { handle })
+        }
+    }
+
+    fn raw(&self) -> HANDLE {
+        self.handle
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn final_path_name(handle: HANDLE) -> Option<PathBuf> {
+    let flags = VOLUME_NAME_DOS | FILE_NAME_NORMALIZED;
+    let mut buffer = vec![0_u16; 32_768];
+    let written = unsafe {
+        GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, flags)
+    };
+
+    if written == 0 {
+        return None;
+    }
+
+    if written as usize >= buffer.len() {
+        buffer.resize(written as usize + 1, 0);
+        let written = unsafe {
+            GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, flags)
+        };
+        if written == 0 || written as usize >= buffer.len() {
+            return None;
+        }
+        buffer.truncate(written as usize);
+    } else {
+        buffer.truncate(written as usize);
+    }
+
+    let path = String::from_utf16_lossy(&buffer);
+    Some(PathBuf::from(strip_windows_path_namespace(&path)))
+}
+
+#[cfg(windows)]
+fn strip_windows_path_namespace(path: &str) -> String {
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{path}")
+    } else if let Some(path) = path.strip_prefix(r"\\?\") {
+        path.to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+#[cfg(windows)]
+fn path_matches_directory(path: &StdPath, directory: &StdPath) -> bool {
+    path == directory
+        || path.starts_with(directory)
+        || windows_path_string(path).is_some_and(|path| {
+            windows_path_string(directory).is_some_and(|directory| {
+                path == directory
+                    || path
+                        .strip_prefix(&directory)
+                        .is_some_and(|rest| rest.starts_with('\\'))
+            })
+        })
+}
+
+#[cfg(windows)]
+fn windows_path_string(path: &StdPath) -> Option<String> {
+    Some(
+        strip_windows_path_namespace(&path.as_os_str().to_string_lossy())
+            .replace('/', "\\")
+            .to_lowercase(),
+    )
 }
 
 #[cfg(test)]

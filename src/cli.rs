@@ -36,7 +36,7 @@ pub struct Cli {
     #[arg(short = 'c', long, action = ArgAction::SetTrue)]
     pub case_sensitive: bool,
 
-    /// Kill processes whose current working directory is this directory or below it
+    /// Kill processes holding files or directories under this directory
     #[arg(short = 'd', long = "directory", value_name = "DIR")]
     pub directories: Vec<PathBuf>,
 
