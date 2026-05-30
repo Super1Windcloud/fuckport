@@ -9,6 +9,7 @@ fn main() {
             Target::Port(port) => println!("port {port}"),
             Target::Name(name) => println!("name {name}"),
             Target::Directory(path) => println!("directory {}", path.display()),
+            Target::File(path) => println!("file {}", path.display()),
         }
     }
 }

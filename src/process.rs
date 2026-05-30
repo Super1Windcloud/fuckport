@@ -166,6 +166,9 @@ impl ProcessCatalog {
                 Target::Directory(directory) => {
                     matches.extend(self.match_by_directory(directory)?);
                 }
+                Target::File(file) => {
+                    matches.extend(self.match_by_file(file)?);
+                }
             }
         }
 
@@ -203,6 +206,11 @@ impl ProcessCatalog {
         let mut matches = directory_handle_owners(&directory)?;
         matches.extend(self.match_by_cwd(&directory));
         Ok(matches)
+    }
+
+    fn match_by_file(&self, file: &StdPath) -> AppResult<BTreeSet<Pid>> {
+        let file = canonical_file(file)?;
+        file_handle_owners(&file)
     }
 
     fn match_by_cwd(&self, directory: &StdPath) -> BTreeSet<Pid> {
@@ -452,6 +460,18 @@ fn canonical_directory(directory: &StdPath) -> AppResult<PathBuf> {
     Ok(path)
 }
 
+fn canonical_file(file: &StdPath) -> AppResult<PathBuf> {
+    let path = file
+        .canonicalize()
+        .with_context(|| format!("failed to resolve file {}", file.display()))?;
+
+    if !path.is_file() {
+        bail!("{} is not a file", file.display());
+    }
+
+    Ok(path)
+}
+
 fn cwd_matches_directory(cwd: &StdPath, directory: &StdPath) -> bool {
     cwd.canonicalize()
         .map(|cwd| cwd == directory || cwd.starts_with(directory))
@@ -480,6 +500,31 @@ fn directory_handle_owners(directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
 
 #[cfg(not(windows))]
 fn directory_handle_owners(_directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
+    Ok(BTreeSet::new())
+}
+
+#[cfg(windows)]
+fn file_handle_owners(file: &StdPath) -> AppResult<BTreeSet<Pid>> {
+    let mut matches = BTreeSet::new();
+
+    for handle in system_handles()? {
+        let process_id = handle.unique_process_id as u32;
+        if process_id == 0 {
+            continue;
+        }
+
+        if let Some(path) = duplicated_handle_path(process_id, handle.handle_value) {
+            if path_matches_file(&path, file) {
+                matches.insert(Pid::from_u32(process_id));
+            }
+        }
+    }
+
+    Ok(matches)
+}
+
+#[cfg(not(windows))]
+fn file_handle_owners(_file: &StdPath) -> AppResult<BTreeSet<Pid>> {
     Ok(BTreeSet::new())
 }
 
@@ -648,6 +693,13 @@ fn path_matches_directory(path: &StdPath, directory: &StdPath) -> bool {
                         .is_some_and(|rest| rest.starts_with('\\'))
             })
         })
+}
+
+#[cfg(windows)]
+fn path_matches_file(path: &StdPath, file: &StdPath) -> bool {
+    path == file
+        || windows_path_string(path)
+            .is_some_and(|path| windows_path_string(file).is_some_and(|file| path == file))
 }
 
 #[cfg(windows)]

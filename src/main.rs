@@ -32,6 +32,7 @@ fn run(cli: Cli) -> AppResult<()> {
                 .cloned()
                 .map(fuckport::input::Target::Directory),
         );
+        targets.extend(cli.files.iter().cloned().map(fuckport::input::Target::File));
         catalog.resolve_targets(&targets, cli.case_sensitive)?
     };
 
@@ -50,7 +51,8 @@ fn run(cli: Cli) -> AppResult<()> {
 }
 
 fn should_use_interactive(cli: &Cli) -> bool {
-    cli.interactive || (cli.targets.is_empty() && cli.directories.is_empty())
+    cli.interactive
+        || (cli.targets.is_empty() && cli.directories.is_empty() && cli.files.is_empty())
 }
 
 fn report_error(error: &anyhow::Error) {
@@ -78,12 +80,18 @@ mod tests {
 
     use super::should_use_interactive;
 
-    fn cli(targets: Vec<String>, directories: Vec<PathBuf>, interactive: bool) -> Cli {
+    fn cli(
+        targets: Vec<String>,
+        directories: Vec<PathBuf>,
+        files: Vec<PathBuf>,
+        interactive: bool,
+    ) -> Cli {
         Cli {
             targets,
             force: false,
             case_sensitive: false,
             directories,
+            files,
             silent: false,
             verbose: false,
             interactive,
@@ -94,7 +102,12 @@ mod tests {
 
     #[test]
     fn defaults_to_interactive_without_targets_or_directories() {
-        assert!(should_use_interactive(&cli(Vec::new(), Vec::new(), false)));
+        assert!(should_use_interactive(&cli(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+        )));
     }
 
     #[test]
@@ -102,6 +115,17 @@ mod tests {
         assert!(!should_use_interactive(&cli(
             Vec::new(),
             vec![PathBuf::from(".")],
+            Vec::new(),
+            false,
+        )));
+    }
+
+    #[test]
+    fn file_target_disables_default_interactive_mode() {
+        assert!(!should_use_interactive(&cli(
+            Vec::new(),
+            Vec::new(),
+            vec![PathBuf::from("Cargo.toml")],
             false,
         )));
     }
@@ -111,6 +135,7 @@ mod tests {
         assert!(should_use_interactive(&cli(
             Vec::new(),
             vec![PathBuf::from(".")],
+            Vec::new(),
             true,
         )));
     }

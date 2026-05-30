@@ -8,6 +8,7 @@ pub enum Target {
     Port(u16),
     Name(String),
     Directory(PathBuf),
+    File(PathBuf),
 }
 
 pub fn parse_targets(input: &[String]) -> Vec<Target> {

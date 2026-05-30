@@ -40,6 +40,10 @@ pub struct Cli {
     #[arg(short = 'd', long = "directory", value_name = "DIR")]
     pub directories: Vec<PathBuf>,
 
+    /// Kill processes holding this file open
+    #[arg(short = 'F', long = "file", value_name = "FILE")]
+    pub files: Vec<PathBuf>,
+
     /// Suppress per-process success output
     #[arg(short, long, action = ArgAction::SetTrue)]
     pub silent: bool,

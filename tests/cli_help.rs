@@ -13,4 +13,5 @@ fn help_mentions_timeout_options() {
     assert!(stdout.contains("--force-after-timeout"));
     assert!(stdout.contains("--wait-for-exit"));
     assert!(stdout.contains("--directory"));
+    assert!(stdout.contains("--file"));
 }
