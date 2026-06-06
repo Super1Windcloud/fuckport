@@ -172,7 +172,7 @@ impl ProcessCatalog {
             }
         }
 
-        matches.remove(&self.current_pid);
+        matches.retain(|pid| is_killable_target(*pid, self.current_pid));
 
         if matches.is_empty() {
             bail!("no matching processes found");
@@ -410,11 +410,19 @@ fn port_map() -> AppResult<BTreeMap<u16, BTreeSet<Pid>>> {
         };
 
         for pid in socket.associated_pids {
+            if pid == 0 {
+                continue;
+            }
+
             result.entry(port).or_default().insert(Pid::from_u32(pid));
         }
     }
 
     Ok(result)
+}
+
+fn is_killable_target(pid: Pid, current_pid: Pid) -> bool {
+    pid.as_u32() != 0 && pid != current_pid
 }
 
 fn reverse_port_map(port_map: &BTreeMap<u16, BTreeSet<Pid>>) -> BTreeMap<Pid, BTreeSet<u16>> {
@@ -715,7 +723,9 @@ fn windows_path_string(path: &StdPath) -> Option<String> {
 mod tests {
     use std::fs;
 
-    use super::{cwd_matches_directory, name_matches};
+    use sysinfo::Pid;
+
+    use super::{cwd_matches_directory, is_killable_target, name_matches};
 
     #[test]
     fn name_matching_is_case_insensitive_by_default() {
@@ -742,6 +752,13 @@ mod tests {
             "http.server",
             false
         ));
+    }
+
+    #[test]
+    fn killable_target_excludes_system_and_current_processes() {
+        assert!(!is_killable_target(Pid::from_u32(0), Pid::from_u32(42)));
+        assert!(!is_killable_target(Pid::from_u32(42), Pid::from_u32(42)));
+        assert!(is_killable_target(Pid::from_u32(43), Pid::from_u32(42)));
     }
 
     #[test]
