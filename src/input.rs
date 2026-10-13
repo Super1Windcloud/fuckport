@@ -9,6 +9,7 @@ pub enum Target {
     Name(String),
     Directory(PathBuf),
     File(PathBuf),
+    InvalidPort { input: String, reason: String },
 }
 
 pub fn parse_targets(input: &[String]) -> Vec<Target> {
@@ -16,11 +17,32 @@ pub fn parse_targets(input: &[String]) -> Vec<Target> {
 }
 
 fn parse_target(input: &str) -> Target {
-    if let Some(port) = input
-        .strip_prefix(':')
-        .and_then(|value| value.parse::<u16>().ok())
-    {
-        return Target::Port(port);
+    if let Some(port_str) = input.strip_prefix(':') {
+        if port_str.is_empty() {
+            return Target::InvalidPort {
+                input: input.to_string(),
+                reason: "port number cannot be empty".to_string(),
+            };
+        }
+
+        if port_str.chars().all(|c| c.is_ascii_digit()) {
+            match port_str.parse::<u16>() {
+                Ok(0) => {
+                    return Target::InvalidPort {
+                        input: input.to_string(),
+                        reason: "port number must be between 1 and 65535, got 0".to_string(),
+                    };
+                }
+                Ok(port) => return Target::Port(port),
+                Err(_) => {
+                    return Target::InvalidPort {
+                        input: input.to_string(),
+                        reason: "port number out of range (must be between 1 and 65535)"
+                            .to_string(),
+                    };
+                }
+            }
+        }
     }
 
     if let Ok(pid) = input.parse::<u32>() {
@@ -49,5 +71,13 @@ mod tests {
     fn keeps_invalid_port_like_input_as_name() {
         let parsed = parse_targets(&[":abc".to_string()]);
         assert!(matches!(parsed[0], Target::Name(ref name) if name == ":abc"));
+    }
+
+    #[test]
+    fn detects_out_of_range_and_empty_port_targets() {
+        let parsed = parse_targets(&[":99999".to_string(), ":0".to_string(), ":".to_string()]);
+        assert!(matches!(&parsed[0], Target::InvalidPort { input, .. } if input == ":99999"));
+        assert!(matches!(&parsed[1], Target::InvalidPort { input, .. } if input == ":0"));
+        assert!(matches!(&parsed[2], Target::InvalidPort { input, .. } if input == ":"));
     }
 }

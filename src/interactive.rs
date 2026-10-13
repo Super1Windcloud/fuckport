@@ -38,9 +38,18 @@ pub fn pick_interactive(catalog: &ProcessCatalog, verbose: bool) -> AppResult<BT
         return Ok(BTreeSet::new());
     }
 
-    let mut terminal = init_terminal().context("interactive mode failed")?;
-    let result = run_app(&mut terminal, records, verbose);
-    restore_terminal(terminal).context("failed to restore terminal")?;
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let mut stdout = std::io::stdout();
+        let _ = execute!(stdout, crossterm::cursor::Show);
+        original_hook(info);
+    }));
+
+    let mut guard = TerminalGuard::enter().context("interactive mode failed")?;
+    let result = run_app(guard.terminal_mut(), records, verbose);
+    guard.restore().context("failed to restore terminal")?;
 
     result.map(|state| state.selected_pids().into_iter().collect::<BTreeSet<_>>())
 }
@@ -67,18 +76,39 @@ fn run_app(
     }
 }
 
-fn init_terminal() -> io::Result<DefaultTerminal> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))
+struct TerminalGuard {
+    terminal: Option<DefaultTerminal>,
 }
 
-fn restore_terminal(mut terminal: DefaultTerminal) -> io::Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-    Ok(())
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(stdout))?;
+        Ok(Self {
+            terminal: Some(terminal),
+        })
+    }
+
+    fn terminal_mut(&mut self) -> &mut DefaultTerminal {
+        self.terminal.as_mut().expect("terminal already restored")
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        if let Some(mut terminal) = self.terminal.take() {
+            disable_raw_mode()?;
+            execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+            terminal.show_cursor()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 fn drain_pending_events() -> AppResult<()> {
@@ -167,13 +197,20 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> bool {
 }
 
 fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
+    let area = frame.area();
+    if area.height < 6 || area.width < 12 {
+        let text = Paragraph::new("Terminal too small").style(Style::default().fg(Color::Yellow));
+        frame.render_widget(text, area);
+        return;
+    }
+
     let vertical = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(8),
         Constraint::Length(3),
         Constraint::Length(2),
     ]);
-    let [search_area, table_area, detail_area, help_area] = vertical.areas(frame.area());
+    let [search_area, table_area, detail_area, help_area] = vertical.areas(area);
 
     render_search(frame, search_area, state);
     render_table(frame, table_area, state);

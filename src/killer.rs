@@ -70,6 +70,32 @@ where
         };
 
         let name = process.name().to_string_lossy().into_owned();
+
+        if process.status() == sysinfo::ProcessStatus::Zombie
+            || process.status() == sysinfo::ProcessStatus::Dead
+        {
+            let parent_info = process
+                .parent()
+                .map(|p| format!(" (terminate its parent PID {} to reap it)", p.as_u32()))
+                .unwrap_or_default();
+            failed.push(format!(
+                "{} ({name}) is a zombie/defunct process and cannot be killed directly{parent_info}",
+                pid.as_u32()
+            ));
+            continue;
+        }
+
+        if let Some(expected_start) = catalog.initial_start_time(*pid) {
+            if process.start_time() != expected_start {
+                failed.push(format!(
+                    "{} ({name}, process start time changed from {expected_start} to {}, refusing to kill recycled PID)",
+                    pid.as_u32(),
+                    process.start_time()
+                ));
+                continue;
+            }
+        }
+
         let attempted_graceful = !options.force && terminator(process);
         let killed = if attempted_graceful {
             wait_until_exit_or_timeout(
@@ -87,11 +113,8 @@ where
             false
         };
 
-        if !exited {
-            catalog.refresh();
-            if catalog.system().process(*pid).is_none() {
-                exited = true;
-            }
+        if !exited && !catalog.refresh_pid(*pid) {
+            exited = true;
         }
 
         let mut tried_sudo = false;
@@ -242,15 +265,13 @@ fn force_kill(catalog: &mut ProcessCatalog, pid: Pid) -> bool {
 
 fn wait_until_exit_or_timeout(catalog: &mut ProcessCatalog, pid: Pid, timeout: Duration) -> bool {
     for sleep_ms in backoff_intervals(timeout) {
-        catalog.refresh();
-        if catalog.system().process(pid).is_none() {
+        if !catalog.refresh_pid(pid) {
             return true;
         }
         thread::sleep(Duration::from_millis(sleep_ms));
     }
 
-    catalog.refresh();
-    catalog.system().process(pid).is_none()
+    !catalog.refresh_pid(pid)
 }
 
 fn backoff_intervals(timeout: Duration) -> Vec<u64> {
@@ -477,5 +498,46 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(!sudo_called.load(Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_recycling_refuses_to_kill_replaced_process() {
+        use std::process::Command;
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("failed to spawn sleep child process");
+        let pid = Pid::from_u32(child.id());
+
+        let mut catalog = ProcessCatalog::load().expect("failed to load catalog");
+        let pids = BTreeSet::from([pid]);
+        let options = KillOptions {
+            force: false,
+            silent: true,
+            force_after_timeout: 50,
+            wait_for_exit: 50,
+        };
+
+        // Mutate initial_start_times so that it simulates another process taking over this PID
+        catalog.initial_start_times.insert(pid, 1);
+
+        let result = kill_processes_pipeline(
+            &mut catalog,
+            &pids,
+            &options,
+            false,
+            |_proc| true,
+            |_cat, _p| true,
+            |_p, _sig| false,
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("refusing to kill recycled PID"));
     }
 }

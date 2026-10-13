@@ -76,6 +76,8 @@ pub struct ProcessCatalog {
     pids_by_port: BTreeMap<u16, BTreeSet<Pid>>,
     ports_by_pid: BTreeMap<Pid, BTreeSet<u16>>,
     current_pid: Pid,
+    port_error: Option<String>,
+    pub(crate) initial_start_times: BTreeMap<Pid, u64>,
 }
 
 impl ProcessCatalog {
@@ -83,22 +85,45 @@ impl ProcessCatalog {
         let mut system = System::new_all();
         refresh_processes(&mut system);
 
-        let pids_by_port = port_map()?;
+        let (pids_by_port, port_error) = match port_map() {
+            Ok(map) => (map, None),
+            Err(err) => (BTreeMap::new(), Some(err.to_string())),
+        };
         let ports_by_pid = reverse_port_map(&pids_by_port);
         let current_pid = sysinfo::get_current_pid()
             .map_err(anyhow::Error::msg)
             .context("failed to read current pid")?;
+
+        let mut initial_start_times = BTreeMap::new();
+        for (pid, process) in system.processes() {
+            initial_start_times.insert(*pid, process.start_time());
+        }
 
         Ok(Self {
             system,
             pids_by_port,
             ports_by_pid,
             current_pid,
+            port_error,
+            initial_start_times,
         })
     }
 
     pub fn refresh(&mut self) {
         refresh_processes(&mut self.system);
+    }
+
+    pub fn refresh_pid(&mut self, pid: Pid) -> bool {
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        self.system.process(pid).is_some()
+    }
+
+    pub fn initial_start_time(&self, pid: Pid) -> Option<u64> {
+        self.initial_start_times.get(&pid).copied()
     }
 
     pub fn system(&self) -> &System {
@@ -158,6 +183,10 @@ impl ProcessCatalog {
                 Target::Port(port) => {
                     if let Some(pids) = self.pids_by_port.get(port) {
                         matches.extend(pids.iter().copied());
+                    } else if let Some(ref err) = self.port_error {
+                        bail!(
+                            "cannot resolve port :{port} because socket enumeration failed: {err}"
+                        );
                     }
                 }
                 Target::Name(name) => {
@@ -168,6 +197,9 @@ impl ProcessCatalog {
                 }
                 Target::File(file) => {
                     matches.extend(self.match_by_file(file)?);
+                }
+                Target::InvalidPort { input, reason } => {
+                    bail!("invalid port target '{input}': {reason}");
                 }
             }
         }
@@ -506,32 +538,61 @@ fn directory_handle_owners(directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
     Ok(matches)
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+fn directory_handle_owners(directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
+    let output = std::process::Command::new("lsof")
+        .arg("-t")
+        .arg("+D")
+        .arg(directory)
+        .output();
+
+    parse_lsof_output(output)
+}
+
+#[cfg(unix)]
+fn file_handle_owners(file: &StdPath) -> AppResult<BTreeSet<Pid>> {
+    let output = std::process::Command::new("lsof")
+        .arg("-t")
+        .arg("--")
+        .arg(file)
+        .output();
+
+    parse_lsof_output(output)
+}
+
+#[cfg(unix)]
+fn parse_lsof_output(
+    output_result: std::io::Result<std::process::Output>,
+) -> AppResult<BTreeSet<Pid>> {
+    let output = match output_result {
+        Ok(out) => out,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            bail!("'lsof' command not found; cannot inspect open file handles on Unix");
+        }
+        Err(err) => {
+            bail!("failed to execute 'lsof': {err}");
+        }
+    };
+
+    let mut pids = BTreeSet::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Ok(pid) = line.parse::<u32>() {
+            if pid != 0 {
+                pids.insert(Pid::from_u32(pid));
+            }
+        }
+    }
+    Ok(pids)
+}
+
+#[cfg(not(any(windows, unix)))]
 fn directory_handle_owners(_directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
     Ok(BTreeSet::new())
 }
 
-#[cfg(windows)]
-fn file_handle_owners(file: &StdPath) -> AppResult<BTreeSet<Pid>> {
-    let mut matches = BTreeSet::new();
-
-    for handle in system_handles()? {
-        let process_id = handle.unique_process_id as u32;
-        if process_id == 0 {
-            continue;
-        }
-
-        if let Some(path) = duplicated_handle_path(process_id, handle.handle_value) {
-            if path_matches_file(&path, file) {
-                matches.insert(Pid::from_u32(process_id));
-            }
-        }
-    }
-
-    Ok(matches)
-}
-
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 fn file_handle_owners(_file: &StdPath) -> AppResult<BTreeSet<Pid>> {
     Ok(BTreeSet::new())
 }
@@ -725,7 +786,7 @@ mod tests {
 
     use sysinfo::Pid;
 
-    use super::{cwd_matches_directory, is_killable_target, name_matches};
+    use super::{ProcessCatalog, cwd_matches_directory, is_killable_target, name_matches};
 
     #[test]
     fn name_matching_is_case_insensitive_by_default() {
@@ -789,5 +850,56 @@ mod tests {
         assert!(!cwd_matches_directory(&sibling, &root));
 
         fs::remove_dir_all(&base).expect("failed to clean test directory");
+    }
+
+    #[test]
+    fn invalid_port_target_returns_clear_error_in_resolve_targets() {
+        use crate::input::Target;
+
+        let catalog = ProcessCatalog::load().expect("failed to load catalog");
+        let targets = vec![Target::InvalidPort {
+            input: ":99999".to_string(),
+            reason: "port number out of range (must be between 1 and 65535)".to_string(),
+        }];
+
+        let result = catalog.resolve_targets(&targets, false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid port target ':99999'"));
+        assert!(err.contains("port number out of range"));
+    }
+
+    #[test]
+    fn socket_enumeration_failure_reports_clear_error_for_port_targets() {
+        use crate::input::Target;
+        use std::collections::BTreeMap;
+
+        let mut catalog = ProcessCatalog::load().expect("failed to load catalog");
+        catalog.pids_by_port = BTreeMap::new();
+        catalog.port_error = Some("permission denied accessing sockets".to_string());
+
+        let targets = vec![Target::Port(8080)];
+        let result = catalog.resolve_targets(&targets, false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("cannot resolve port :8080"));
+        assert!(err.contains("socket enumeration failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_handle_owners_finds_open_file_holder() {
+        use super::file_handle_owners;
+        use sysinfo::Pid;
+
+        let temp_file =
+            std::env::temp_dir().join(format!("fuckport-test-lsof-{}", std::process::id()));
+        let file = std::fs::File::create(&temp_file).expect("failed to create temp file");
+
+        let owners = file_handle_owners(&temp_file).expect("lsof execution failed");
+        assert!(owners.contains(&Pid::from_u32(std::process::id())));
+
+        drop(file);
+        let _ = std::fs::remove_file(&temp_file);
     }
 }
