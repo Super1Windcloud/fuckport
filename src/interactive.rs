@@ -198,23 +198,48 @@ fn handle_key_event(state: &mut AppState, key: KeyEvent) -> bool {
 
 fn draw(frame: &mut Frame<'_>, state: &mut AppState) {
     let area = frame.area();
-    if area.height < 6 || area.width < 12 {
-        let text = Paragraph::new("Terminal too small").style(Style::default().fg(Color::Yellow));
+    if area.height < 7 || area.width < 36 {
+        let msg = format!(
+            "Window too small ({}x{}). Need at least 36x7.",
+            area.width, area.height
+        );
+        let text = Paragraph::new(msg).style(Style::default().fg(Color::Yellow));
         frame.render_widget(text, area);
         return;
     }
 
-    let vertical = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(8),
-        Constraint::Length(3),
-        Constraint::Length(2),
-    ]);
-    let [search_area, table_area, detail_area, help_area] = vertical.areas(area);
+    let show_details = area.height >= 16;
+    let help_height = if area.height >= 12 { 2 } else { 1 };
+
+    let vertical = if show_details {
+        Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(3),
+            Constraint::Length(help_height),
+        ])
+    } else {
+        Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(4),
+            Constraint::Length(help_height),
+        ])
+    };
+
+    let areas = vertical.split(area);
+    let search_area = areas[0];
+    let table_area = areas[1];
+    let (detail_area, help_area) = if show_details {
+        (Some(areas[2]), areas[3])
+    } else {
+        (None, areas[2])
+    };
 
     render_search(frame, search_area, state);
     render_table(frame, table_area, state);
-    render_detail(frame, detail_area, state);
+    if let Some(detail_area) = detail_area {
+        render_detail(frame, detail_area, state);
+    }
     render_help(frame, help_area, state);
 }
 
@@ -239,65 +264,228 @@ fn render_search(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     state.sync_table_state();
 
-    let header = Row::new([
-        Cell::from("Sel"),
-        Cell::from("PID"),
-        Cell::from("App"),
-        Cell::from("Process"),
-        Cell::from(format!("{:>6}", "CPU")),
-        Cell::from("Memory"),
-        Cell::from("Ports"),
-    ])
-    .style(
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )
-    .height(1);
-
     let filtered_records = state.filtered_records();
-    let widths = compute_table_widths(&filtered_records, state.verbose, area.width);
-    let app_width = constraint_length(widths[2]);
-    let process_width = constraint_length(widths[3]);
-    let rows = filtered_records.into_iter().map(|record| {
-        let selected = if state.is_selected(record.pid) {
-            "[x]"
-        } else {
-            "[ ]"
-        };
+    let width = area.width;
 
-        let process_name = if state.verbose && !record.cmd.is_empty() {
-            format!("{} | {}", record.name, truncate(&record.cmd, 48))
-        } else {
-            record.name.clone()
-        };
-
-        let cpu_style = cpu_style(record.cpu_usage);
-        let mem_style = memory_style(record.memory_bytes);
-        let wrapped_app_name = wrap_cell_text(&record.app_name, app_width);
-        let wrapped_process_name = wrap_cell_text(&process_name, process_width);
-        let wrapped_ports = format_ports_wrapped(&record.ports);
-        let row_lines = wrapped_app_name
-            .lines()
-            .count()
-            .max(wrapped_process_name.lines().count())
-            .max(wrapped_ports.lines().count())
-            .max(1) as u16;
-
-        Row::new([
-            Cell::from(selected),
-            Cell::from(record.pid.as_u32().to_string()),
-            Cell::from(wrapped_app_name),
-            Cell::from(wrapped_process_name),
-            Cell::from(format!("{:>5.1}%", record.cpu_usage)).style(cpu_style),
-            Cell::from(format_memory(record.memory_bytes)).style(mem_style),
-            Cell::from(wrapped_ports),
+    let (header, widths, column_spacing, rows) = if width >= 90 {
+        // Full Tier (>= 90 columns)
+        let header = Row::new([
+            Cell::from("Sel"),
+            Cell::from("PID"),
+            Cell::from("App"),
+            Cell::from("Process"),
+            Cell::from(format!("{:>6}", "CPU")),
+            Cell::from("Memory"),
+            Cell::from("Ports"),
         ])
-        .height(row_lines)
-    });
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .height(1);
+
+        let widths = compute_table_widths(&filtered_records, state.verbose, width);
+        let app_width = constraint_length(widths[2]);
+        let process_width = constraint_length(widths[3]);
+
+        let rows = filtered_records.into_iter().map(|record| {
+            let selected = if state.is_selected(record.pid) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+
+            let process_name = if state.verbose && !record.cmd.is_empty() {
+                format!("{} | {}", record.name, truncate(&record.cmd, 48))
+            } else {
+                record.name.clone()
+            };
+
+            let cpu_style = cpu_style(record.cpu_usage);
+            let mem_style = memory_style(record.memory_bytes);
+            let truncated_app = truncate(&record.app_name, app_width);
+            let truncated_proc = truncate(&process_name, process_width);
+            let wrapped_ports = format_ports_inline(&record.ports);
+
+            Row::new([
+                Cell::from(selected),
+                Cell::from(record.pid.as_u32().to_string()),
+                Cell::from(truncated_app),
+                Cell::from(truncated_proc),
+                Cell::from(format!("{:>5.1}%", record.cpu_usage)).style(cpu_style),
+                Cell::from(format_memory(record.memory_bytes)).style(mem_style),
+                Cell::from(wrapped_ports),
+            ])
+            .height(1)
+        });
+
+        (
+            header,
+            widths.to_vec(),
+            TABLE_COLUMN_SPACING,
+            rows.collect::<Vec<_>>(),
+        )
+    } else if width >= 70 {
+        // Standard Tier (70..90 columns): Fold Ports
+        let header = Row::new([
+            Cell::from("Sel"),
+            Cell::from("PID"),
+            Cell::from("App"),
+            Cell::from("Process"),
+            Cell::from(format!("{:>5}", "CPU")),
+            Cell::from("Mem"),
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .height(1);
+
+        let sel_w = 4_u16;
+        let pid_w = 6_u16;
+        let cpu_w = 6_u16;
+        let mem_w = 7_u16;
+        let spacing = 1_u16;
+        let overhead = sel_w + pid_w + cpu_w + mem_w + spacing * 5 + 2;
+        let flex = width.saturating_sub(overhead);
+        let app_w = (flex * 35 / 100).max(8);
+        let proc_w = flex.saturating_sub(app_w).max(12);
+
+        let widths = vec![
+            Constraint::Length(sel_w),
+            Constraint::Length(pid_w),
+            Constraint::Length(app_w),
+            Constraint::Length(proc_w),
+            Constraint::Length(cpu_w),
+            Constraint::Length(mem_w),
+        ];
+
+        let rows = filtered_records.into_iter().map(|record| {
+            let selected = if state.is_selected(record.pid) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+
+            Row::new([
+                Cell::from(selected),
+                Cell::from(record.pid.as_u32().to_string()),
+                Cell::from(truncate(&record.app_name, app_w as usize)),
+                Cell::from(truncate(&record.name, proc_w as usize)),
+                Cell::from(format!("{:>5.1}%", record.cpu_usage))
+                    .style(cpu_style(record.cpu_usage)),
+                Cell::from(format_memory(record.memory_bytes))
+                    .style(memory_style(record.memory_bytes)),
+            ])
+            .height(1)
+        });
+
+        (header, widths, spacing, rows.collect::<Vec<_>>())
+    } else if width >= 50 {
+        // Compact Tier (50..70 columns): Fold Ports and App
+        let header = Row::new([
+            Cell::from("Sel"),
+            Cell::from("PID"),
+            Cell::from("Process"),
+            Cell::from(format!("{:>5}", "CPU")),
+            Cell::from("Mem"),
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .height(1);
+
+        let sel_w = 4_u16;
+        let pid_w = 6_u16;
+        let cpu_w = 6_u16;
+        let mem_w = 7_u16;
+        let spacing = 1_u16;
+        let overhead = sel_w + pid_w + cpu_w + mem_w + spacing * 4 + 2;
+        let proc_w = width.saturating_sub(overhead).max(10);
+
+        let widths = vec![
+            Constraint::Length(sel_w),
+            Constraint::Length(pid_w),
+            Constraint::Length(proc_w),
+            Constraint::Length(cpu_w),
+            Constraint::Length(mem_w),
+        ];
+
+        let rows = filtered_records.into_iter().map(|record| {
+            let selected = if state.is_selected(record.pid) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+
+            Row::new([
+                Cell::from(selected),
+                Cell::from(record.pid.as_u32().to_string()),
+                Cell::from(truncate(&record.name, proc_w as usize)),
+                Cell::from(format!("{:>5.1}%", record.cpu_usage))
+                    .style(cpu_style(record.cpu_usage)),
+                Cell::from(format_memory(record.memory_bytes))
+                    .style(memory_style(record.memory_bytes)),
+            ])
+            .height(1)
+        });
+
+        (header, widths, spacing, rows.collect::<Vec<_>>())
+    } else {
+        // Minimal Tier (< 50 columns): Core info only
+        let header = Row::new([
+            Cell::from("S"),
+            Cell::from("PID"),
+            Cell::from("Process"),
+            Cell::from("CPU"),
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .height(1);
+
+        let sel_w = 3_u16;
+        let pid_w = 6_u16;
+        let cpu_w = 6_u16;
+        let spacing = 1_u16;
+        let overhead = sel_w + pid_w + cpu_w + spacing * 3 + 2;
+        let proc_w = width.saturating_sub(overhead).max(8);
+
+        let widths = vec![
+            Constraint::Length(sel_w),
+            Constraint::Length(pid_w),
+            Constraint::Length(proc_w),
+            Constraint::Length(cpu_w),
+        ];
+
+        let rows = filtered_records.into_iter().map(|record| {
+            let selected = if state.is_selected(record.pid) {
+                "*"
+            } else {
+                " "
+            };
+
+            Row::new([
+                Cell::from(selected),
+                Cell::from(record.pid.as_u32().to_string()),
+                Cell::from(truncate(&record.name, proc_w as usize)),
+                Cell::from(format!("{:>5.1}%", record.cpu_usage))
+                    .style(cpu_style(record.cpu_usage)),
+            ])
+            .height(1)
+        });
+
+        (header, widths, spacing, rows.collect::<Vec<_>>())
+    };
 
     let table = Table::new(rows, widths)
-        .column_spacing(TABLE_COLUMN_SPACING)
+        .column_spacing(column_spacing)
         .header(header)
         .row_highlight_style(
             Style::default()
@@ -320,30 +508,59 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 }
 
 fn render_help(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
     let total = state.filtered_records().len();
     let selected = state.selected.len();
     let sort = state.sort_mode.label();
     let search = state.search_mode.label();
-    let line = Line::from(vec![
-        "F1".cyan().bold(),
-        " CPU  ".dark_gray(),
-        "F2".cyan().bold(),
-        " Memory  ".dark_gray(),
-        "F3".cyan().bold(),
-        " Name  ".dark_gray(),
-        "Space".cyan().bold(),
-        " toggle  ".dark_gray(),
-        "Ctrl+A".cyan().bold(),
-        " all  ".dark_gray(),
-        "Tab".cyan().bold(),
-        " search  ".dark_gray(),
-        "Enter".green().bold(),
-        " confirm  ".dark_gray(),
-        "Esc".yellow().bold(),
-        " cancel  ".dark_gray(),
-        format!("Sort {sort}  Search {search}  Showing {total}  Selected {selected}").white(),
-    ]);
-    frame.render_widget(Paragraph::new(line), area);
+
+    let spans = if area.width >= 100 {
+        vec![
+            "F1".cyan().bold(),
+            " CPU ".dark_gray(),
+            "F2".cyan().bold(),
+            " Mem ".dark_gray(),
+            "F3".cyan().bold(),
+            " Name ".dark_gray(),
+            "Space".cyan().bold(),
+            " toggle ".dark_gray(),
+            "Ctrl+A".cyan().bold(),
+            " all ".dark_gray(),
+            "Tab".cyan().bold(),
+            " mode ".dark_gray(),
+            "Enter".green().bold(),
+            " kill ".dark_gray(),
+            "Esc".yellow().bold(),
+            " exit ".dark_gray(),
+            format!("| Sort:{sort}  Mode:{search}  [{selected}/{total}]").white(),
+        ]
+    } else if area.width >= 65 {
+        vec![
+            "Space".cyan().bold(),
+            " sel ".dark_gray(),
+            "Enter".green().bold(),
+            " kill ".dark_gray(),
+            "Tab".cyan().bold(),
+            " mode ".dark_gray(),
+            "Esc".yellow().bold(),
+            " exit ".dark_gray(),
+            format!("| Sort:{sort} [{selected}/{total}]").white(),
+        ]
+    } else {
+        vec![
+            "Space".cyan().bold(),
+            " sel ".dark_gray(),
+            "Enter".green().bold(),
+            " kill ".dark_gray(),
+            "Esc".yellow().bold(),
+            " exit".dark_gray(),
+        ]
+    };
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -351,6 +568,8 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .title(" Details ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue));
+
+    let inner_width = area.width.saturating_sub(2) as usize;
 
     let content = match state.current_record() {
         Some(record) => {
@@ -369,12 +588,15 @@ fn render_detail(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
                 "  Ports ".dark_gray(),
                 ports.white(),
             ]);
-            let cmd = if record.cmd.is_empty() {
+            let cmd_text = if record.cmd.is_empty() {
                 "Command: -".to_string()
             } else {
-                format!("Command: {}", truncate(&record.cmd, 160))
+                format!(
+                    "Command: {}",
+                    truncate(&record.cmd, inner_width.saturating_sub(9))
+                )
             };
-            vec![line1, Line::from(cmd.dark_gray())]
+            vec![line1, Line::from(cmd_text.dark_gray())]
         }
         None => vec![Line::from("No process selected".dark_gray())],
     };
@@ -569,6 +791,7 @@ fn constraint_length(constraint: Constraint) -> usize {
     }
 }
 
+#[cfg(test)]
 fn wrap_cell_text(value: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -586,6 +809,7 @@ fn wrap_cell_text(value: &str, width: usize) -> String {
     }
 }
 
+#[cfg(test)]
 fn wrap_line(value: &str, width: usize) -> Vec<String> {
     if value.is_empty() {
         return vec![String::new()];
@@ -630,6 +854,7 @@ fn wrap_line(value: &str, width: usize) -> Vec<String> {
     lines
 }
 
+#[cfg(test)]
 fn split_long_word(value: &str, width: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
@@ -675,10 +900,37 @@ fn format_memory(bytes: u64) -> String {
     }
 }
 
-fn truncate(value: &str, width: usize) -> String {
-    let mut result = value.chars().take(width).collect::<String>();
-    if value.chars().count() > width && width > 1 {
-        result.pop();
+fn truncate(value: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let total_width = UnicodeWidthStr::width(value);
+    if total_width <= max_width {
+        return value.to_string();
+    }
+
+    if max_width == 1 {
+        return "~".to_string();
+    }
+
+    let mut current_width = 0;
+    let mut chars = Vec::new();
+
+    for ch in value.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + ch_width + 1 > max_width {
+            let mut result: String = chars.into_iter().collect();
+            result.push('~');
+            return result;
+        }
+
+        chars.push(ch);
+        current_width += ch_width;
+    }
+
+    let mut result: String = chars.into_iter().collect();
+    if UnicodeWidthStr::width(result.as_str()) < max_width {
         result.push('~');
     }
     result
@@ -1196,5 +1448,25 @@ mod tests {
             "Microsoft\nEdge\nWebView"
         );
         assert_eq!(wrap_cell_text("verylongtoken", 4), "very\nlong\ntoke\nn");
+    }
+
+    #[test]
+    fn truncate_handles_cjk_characters_safely() {
+        use super::truncate;
+        use unicode_width::UnicodeWidthStr;
+
+        let name = "钉钉办公应用";
+        let t1 = truncate(name, 5);
+        assert!(UnicodeWidthStr::width(t1.as_str()) <= 5);
+        assert_eq!(t1, "钉钉~");
+
+        let t2 = truncate(name, 6);
+        assert!(UnicodeWidthStr::width(t2.as_str()) <= 6);
+
+        let t3 = truncate(name, 12);
+        assert_eq!(t3, "钉钉办公应用");
+
+        let t4 = truncate("hello world", 6);
+        assert_eq!(t4, "hello~");
     }
 }
