@@ -538,6 +538,118 @@ fn directory_handle_owners(directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
     Ok(matches)
 }
 
+#[cfg(windows)]
+fn file_handle_owners(file: &StdPath) -> AppResult<BTreeSet<Pid>> {
+    use std::ffi::OsStr;
+
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::RestartManager::{
+        CCH_RM_SESSION_KEY, RM_PROCESS_INFO, RmGetList, RmRegisterResources, RmStartSession,
+    };
+
+    // The Restart Manager expects a plain DOS path, not a `\\?\` verbatim path.
+    let display_path = strip_windows_path_namespace(&file.as_os_str().to_string_lossy());
+    let wide_path = OsStr::new(&display_path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+
+    let mut session = 0_u32;
+    let mut session_key = [0_u16; CCH_RM_SESSION_KEY as usize + 1];
+    let status = unsafe { RmStartSession(&mut session, 0, session_key.as_mut_ptr()) };
+    if status != ERROR_SUCCESS {
+        bail!("RmStartSession failed with error {status}");
+    }
+    let session = RestartManagerSession(session);
+
+    let files = [wide_path.as_ptr()];
+    let status = unsafe {
+        RmRegisterResources(
+            session.raw(),
+            1,
+            files.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if status != ERROR_SUCCESS {
+        bail!(
+            "cannot inspect handles for {}: RmRegisterResources failed with error {status}",
+            file.display()
+        );
+    }
+
+    let mut needed = 0_u32;
+    let mut count = 0_u32;
+    let mut reboot_reasons = 0_u32;
+    let status = unsafe {
+        RmGetList(
+            session.raw(),
+            &mut needed,
+            &mut count,
+            std::ptr::null_mut(),
+            &mut reboot_reasons,
+        )
+    };
+    if status == ERROR_SUCCESS || needed == 0 {
+        return Ok(BTreeSet::new());
+    }
+    if status != ERROR_MORE_DATA {
+        bail!(
+            "cannot list processes holding {}: RmGetList failed with error {status}",
+            file.display()
+        );
+    }
+
+    let mut infos = vec![RM_PROCESS_INFO::default(); needed as usize];
+    count = needed;
+    let status = unsafe {
+        RmGetList(
+            session.raw(),
+            &mut needed,
+            &mut count,
+            infos.as_mut_ptr(),
+            &mut reboot_reasons,
+        )
+    };
+    if status != ERROR_SUCCESS && status != ERROR_MORE_DATA {
+        bail!(
+            "cannot list processes holding {}: RmGetList failed with error {status}",
+            file.display()
+        );
+    }
+    let filled = (count as usize).min(infos.len());
+    infos.truncate(filled);
+
+    Ok(infos
+        .into_iter()
+        .map(|info| info.Process.dwProcessId)
+        .filter(|process_id| *process_id != 0)
+        .map(Pid::from_u32)
+        .collect())
+}
+
+#[cfg(windows)]
+struct RestartManagerSession(u32);
+
+#[cfg(windows)]
+impl RestartManagerSession {
+    fn raw(&self) -> u32 {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RestartManagerSession {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::RestartManager::RmEndSession(self.0);
+        }
+    }
+}
+
 #[cfg(unix)]
 fn directory_handle_owners(directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
     let output = std::process::Command::new("lsof")
@@ -762,13 +874,6 @@ fn path_matches_directory(path: &StdPath, directory: &StdPath) -> bool {
                         .is_some_and(|rest| rest.starts_with('\\'))
             })
         })
-}
-
-#[cfg(windows)]
-fn path_matches_file(path: &StdPath, file: &StdPath) -> bool {
-    path == file
-        || windows_path_string(path)
-            .is_some_and(|path| windows_path_string(file).is_some_and(|file| path == file))
 }
 
 #[cfg(windows)]
