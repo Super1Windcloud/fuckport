@@ -44,7 +44,7 @@ fn kill_processes_pipeline<T, F, S>(
 ) -> AppResult<()>
 where
     T: FnMut(&sysinfo::Process) -> bool,
-    F: FnMut(&mut ProcessCatalog, Pid) -> bool,
+    F: FnMut(&mut ProcessCatalog, Pid) -> AppResult<bool>,
     S: FnMut(Pid, i32) -> bool,
 {
     if pids.is_empty() {
@@ -97,15 +97,21 @@ where
         }
 
         let attempted_graceful = !options.force && terminator(process);
-        let killed = if attempted_graceful {
-            wait_until_exit_or_timeout(
+        let graceful_exit = attempted_graceful
+            && wait_until_exit_or_timeout(
                 catalog,
                 *pid,
                 Duration::from_millis(options.force_after_timeout),
-            ) || force_killer(catalog, *pid)
-        } else {
-            force_killer(catalog, *pid)
-        };
+            );
+        let mut kill_error = None;
+        let killed = graceful_exit
+            || match force_killer(catalog, *pid) {
+                Ok(killed) => killed,
+                Err(error) => {
+                    kill_error = Some(format!("{error:#}"));
+                    false
+                }
+            };
 
         let mut exited = if killed {
             wait_until_exit_or_timeout(catalog, *pid, Duration::from_millis(options.wait_for_exit))
@@ -115,6 +121,12 @@ where
 
         if !exited && !catalog.refresh_pid(*pid) {
             exited = true;
+        }
+
+        // Errors include process identity mismatches; never bypass them through sudo.
+        if !exited && let Some(reason) = kill_error {
+            failed.push(format!("{} ({name}, {reason})", pid.as_u32()));
+            continue;
         }
 
         let mut tried_sudo = false;
@@ -164,10 +176,10 @@ where
             if !options.silent {
                 let mode = if used_sudo {
                     sudo_mode
-                } else if options.force || !attempted_graceful {
-                    "force"
-                } else {
+                } else if graceful_exit {
                     "graceful"
+                } else {
+                    "force"
                 };
                 println!("Killed {} ({name}) via {mode}", pid.as_u32());
             }
@@ -250,16 +262,127 @@ fn try_terminate(process: &sysinfo::Process) -> bool {
     process.kill_with(Signal::Term).unwrap_or(false)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn try_terminate(process: &sysinfo::Process) -> bool {
+    request_window_close(process.pid())
+}
+
+#[cfg(windows)]
+fn request_window_close(pid: Pid) -> bool {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+    };
+
+    struct CloseRequest {
+        pid: u32,
+        sent: bool,
+    }
+
+    unsafe extern "system" fn close_window(window: HWND, context: LPARAM) -> i32 {
+        // EnumWindows invokes this callback synchronously while the request is alive.
+        let request = unsafe { &mut *(context as *mut CloseRequest) };
+        let mut owner = 0;
+        unsafe { GetWindowThreadProcessId(window, &mut owner) };
+        if owner == request.pid && unsafe { PostMessageW(window, WM_CLOSE, 0, 0) } != 0 {
+            request.sent = true;
+        }
+        1
+    }
+
+    let mut request = CloseRequest {
+        pid: pid.as_u32(),
+        sent: false,
+    };
+    unsafe {
+        EnumWindows(
+            Some(close_window),
+            &mut request as *mut CloseRequest as LPARAM,
+        )
+    };
+    request.sent
+}
+
+#[cfg(not(any(unix, windows)))]
 fn try_terminate(_process: &sysinfo::Process) -> bool {
     false
 }
 
-fn force_kill(catalog: &mut ProcessCatalog, pid: Pid) -> bool {
-    catalog.refresh();
-    match catalog.system().process(pid) {
-        Some(process) => process.kill(),
-        None => true,
+fn force_kill(catalog: &mut ProcessCatalog, pid: Pid) -> AppResult<bool> {
+    if !catalog.refresh_pid(pid) {
+        return Ok(true);
+    }
+    let process = catalog
+        .system()
+        .process(pid)
+        .expect("refreshed process exists");
+    let expected_start = catalog.initial_start_time(pid);
+    if expected_start.is_some_and(|start| start != process.start_time()) {
+        bail!("refusing to kill recycled PID {}", pid.as_u32());
+    }
+
+    #[cfg(windows)]
+    return windows_force_kill(pid, expected_start);
+
+    #[cfg(not(windows))]
+    Ok(process.kill())
+}
+
+#[cfg(windows)]
+fn windows_force_kill(pid: Pid, expected_start: Option<u64>) -> AppResult<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+        TerminateProcess,
+    };
+
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid.as_u32(),
+        )
+    };
+    if handle.is_null() {
+        return Err(windows_kill_error(std::io::Error::last_os_error()));
+    }
+
+    let result = (|| {
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) } == 0
+        {
+            return Err(windows_kill_error(std::io::Error::last_os_error()));
+        }
+        let ticks = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        let start = (ticks / 10_000_000).saturating_sub(11_644_473_600);
+        if expected_start.is_some_and(|expected| expected != start) {
+            bail!("refusing to kill recycled PID {}", pid.as_u32());
+        }
+        if unsafe { TerminateProcess(handle, 1) } == 0 {
+            return Err(windows_kill_error(std::io::Error::last_os_error()));
+        }
+        Ok(true)
+    })();
+    unsafe { CloseHandle(handle) };
+    result
+}
+
+#[cfg(windows)]
+fn windows_kill_error(error: std::io::Error) -> anyhow::Error {
+    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+
+    let error = anyhow::Error::new(error);
+    if error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        == Some(ERROR_ACCESS_DENIED as i32)
+    {
+        error.context("access denied; run fuckport from a terminal opened with 'Run as administrator'; protected processes may still deny termination")
+    } else {
+        error.context("failed to terminate Windows process")
     }
 }
 
@@ -304,6 +427,27 @@ mod tests {
     use super::{KillOptions, backoff_intervals, kill_processes_pipeline};
     use crate::process::ProcessCatalog;
 
+    fn sleep_child() -> std::process::Child {
+        #[cfg(unix)]
+        let mut command = std::process::Command::new("sleep");
+        #[cfg(unix)]
+        command.arg("30");
+        #[cfg(windows)]
+        let mut command = {
+            use std::os::windows::process::CommandExt;
+            let mut command = std::process::Command::new("powershell.exe");
+            command.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 30",
+            ]);
+            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            command
+        };
+        command.spawn().expect("failed to spawn test child")
+    }
+
     #[test]
     fn backoff_stays_within_timeout() {
         let intervals = backoff_intervals(Duration::from_millis(1_500));
@@ -323,17 +467,66 @@ mod tests {
         assert!(intervals.is_empty());
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    #[test]
+    fn access_denied_includes_elevation_guidance_and_original_error() {
+        let error = super::windows_kill_error(std::io::Error::from_raw_os_error(5));
+        assert!(error.to_string().contains("Run as administrator"));
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(5)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_kill_checks_creation_time_before_terminating() {
+        let mut child = sleep_child();
+        let result = super::windows_force_kill(Pid::from_u32(child.id()), Some(1));
+        let still_running = child.try_wait().expect("failed to inspect child").is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(result.unwrap_err().to_string().contains("recycled PID"));
+        assert!(still_running);
+    }
+
+    #[test]
+    fn force_kill_errors_keep_the_underlying_reason() {
+        let mut child = sleep_child();
+        let mut catalog = ProcessCatalog::load().expect("failed to load catalog");
+        let result = kill_processes_pipeline(
+            &mut catalog,
+            &BTreeSet::from([Pid::from_u32(child.id())]),
+            &KillOptions {
+                force: true,
+                silent: true,
+                force_after_timeout: 0,
+                wait_for_exit: 0,
+            },
+            false,
+            |_| panic!("force must skip graceful termination"),
+            |_, _| anyhow::bail!("test permission failure"),
+            |_, _| panic!("escalation is disabled"),
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("test permission failure")
+        );
+    }
+
     #[test]
     fn sudo_escalation_triggers_when_standard_kill_fails() {
-        use std::process::Command;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("failed to spawn sleep child process");
+        let mut child = sleep_child();
         let pid = Pid::from_u32(child.id());
 
         let mut catalog = ProcessCatalog::load().expect("failed to load catalog");
@@ -357,7 +550,7 @@ mod tests {
             &options,
             true,
             |_proc| false,
-            |_cat, _p| false,
+            |_cat, _p| Ok(false),
             move |_p, sig| {
                 sudo_called_clone.store(true, Ordering::SeqCst);
                 sudo_signal_clone.store(sig, Ordering::SeqCst);
@@ -372,17 +565,12 @@ mod tests {
         assert_eq!(sudo_signal.load(Ordering::SeqCst), 15);
     }
 
-    #[cfg(unix)]
     #[test]
     fn sudo_escalation_force_mode_passes_kill_signal() {
-        use std::process::Command;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicI32, Ordering};
 
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("failed to spawn sleep child process");
+        let mut child = sleep_child();
         let pid = Pid::from_u32(child.id());
 
         let mut catalog = ProcessCatalog::load().expect("failed to load catalog");
@@ -403,7 +591,7 @@ mod tests {
             &options,
             true,
             |_proc| false,
-            |_cat, _p| false,
+            |_cat, _p| Ok(false),
             move |_p, sig| {
                 sudo_signal_clone.store(sig, Ordering::SeqCst);
                 let _ = child.kill();
@@ -416,15 +604,9 @@ mod tests {
         assert_eq!(sudo_signal.load(Ordering::SeqCst), 9);
     }
 
-    #[cfg(unix)]
     #[test]
     fn sudo_escalation_reports_error_when_sudo_fails() {
-        use std::process::Command;
-
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("failed to spawn sleep child process");
+        let mut child = sleep_child();
         let pid = Pid::from_u32(child.id());
 
         let mut catalog = ProcessCatalog::load().expect("failed to load catalog");
@@ -442,7 +624,7 @@ mod tests {
             &options,
             true,
             |_proc| false,
-            |_cat, _p| false,
+            |_cat, _p| Ok(false),
             |_p, _sig| false,
         );
 
@@ -454,17 +636,12 @@ mod tests {
         assert!(err_msg.contains("failed to kill even with sudo"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn standard_kill_success_does_not_trigger_sudo() {
-        use std::process::Command;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("failed to spawn sleep child process");
+        let mut child = sleep_child();
         let pid = Pid::from_u32(child.id());
 
         let mut catalog = ProcessCatalog::load().expect("failed to load catalog");
@@ -489,7 +666,7 @@ mod tests {
                 let _ = child.wait();
                 true
             },
-            |_cat, _p| true,
+            |_cat, _p| Ok(true),
             move |_p, _sig| {
                 sudo_called_clone.store(true, Ordering::SeqCst);
                 false
@@ -500,15 +677,9 @@ mod tests {
         assert!(!sudo_called.load(Ordering::SeqCst));
     }
 
-    #[cfg(unix)]
     #[test]
     fn pid_recycling_refuses_to_kill_replaced_process() {
-        use std::process::Command;
-
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("failed to spawn sleep child process");
+        let mut child = sleep_child();
         let pid = Pid::from_u32(child.id());
 
         let mut catalog = ProcessCatalog::load().expect("failed to load catalog");
@@ -529,7 +700,7 @@ mod tests {
             &options,
             false,
             |_proc| true,
-            |_cat, _p| true,
+            |_cat, _p| Ok(true),
             |_p, _sig| false,
         );
 

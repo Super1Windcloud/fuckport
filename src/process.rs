@@ -9,6 +9,7 @@ use std::os::windows::ffi::OsStrExt;
 #[cfg(windows)]
 use std::path::Path;
 use std::path::{Path as StdPath, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 
 use anyhow::{Context, bail};
@@ -34,6 +35,7 @@ use windows_sys::Win32::{
 const SYSTEM_EXTENDED_HANDLE_INFORMATION: u32 = 64;
 
 #[cfg(windows)]
+#[link(name = "ntdll")]
 unsafe extern "system" {
     fn NtQuerySystemInformation(
         system_information_class: u32,
@@ -77,6 +79,7 @@ pub struct ProcessCatalog {
     ports_by_pid: BTreeMap<Pid, BTreeSet<u16>>,
     current_pid: Pid,
     port_error: Option<String>,
+    discovery_warnings: Mutex<Vec<String>>,
     pub(crate) initial_start_times: BTreeMap<Pid, u64>,
 }
 
@@ -105,6 +108,7 @@ impl ProcessCatalog {
             ports_by_pid,
             current_pid,
             port_error,
+            discovery_warnings: Mutex::new(Vec::new()),
             initial_start_times,
         })
     }
@@ -132,6 +136,20 @@ impl ProcessCatalog {
 
     pub fn current_pid(&self) -> Pid {
         self.current_pid
+    }
+
+    pub fn discovery_warnings(&self) -> Vec<String> {
+        let mut warnings = self
+            .discovery_warnings
+            .lock()
+            .expect("warnings lock poisoned")
+            .clone();
+        if let Some(error) = &self.port_error {
+            warnings.push(format!(
+                "ports unavailable: socket enumeration failed: {error}"
+            ));
+        }
+        warnings
     }
 
     pub fn process_records(&self) -> Vec<ProcessRecord> {
@@ -235,7 +253,13 @@ impl ProcessCatalog {
 
     fn match_by_directory(&self, directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
         let directory = canonical_directory(directory)?;
-        let mut matches = directory_handle_owners(&directory)?;
+        let mut warnings = Vec::new();
+        let owners = directory_handle_owners(&directory, &mut warnings);
+        self.discovery_warnings
+            .lock()
+            .expect("warnings lock poisoned")
+            .extend(warnings);
+        let mut matches = owners?;
         matches.extend(self.match_by_cwd(&directory));
         Ok(matches)
     }
@@ -519,8 +543,14 @@ fn cwd_matches_directory(cwd: &StdPath, directory: &StdPath) -> bool {
 }
 
 #[cfg(windows)]
-fn directory_handle_owners(directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
+fn directory_handle_owners(
+    directory: &StdPath,
+    warnings: &mut Vec<String>,
+) -> AppResult<BTreeSet<Pid>> {
     let mut matches = BTreeSet::new();
+    let mut processes = BTreeMap::new();
+    let mut skipped_processes = 0;
+    let mut unresolved_handles = 0;
 
     for handle in system_handles()? {
         let process_id = handle.unique_process_id as u32;
@@ -528,13 +558,30 @@ fn directory_handle_owners(directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
             continue;
         }
 
-        if let Some(path) = duplicated_handle_path(process_id, handle.handle_value) {
-            if path_matches_directory(&path, directory) {
+        let source = processes.entry(process_id).or_insert_with(|| {
+            let source =
+                OwnedHandle::new(unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, process_id) });
+            if source.is_none() {
+                skipped_processes += 1;
+            }
+            source
+        });
+        let Some(source) = source else { continue };
+        match duplicated_handle_path(source.raw(), handle.handle_value) {
+            Ok(Some(path)) if path_matches_directory(&path, directory) => {
                 matches.insert(Pid::from_u32(process_id));
             }
+            Err(_) => unresolved_handles += 1,
+            _ => {}
         }
     }
 
+    if skipped_processes != 0 || unresolved_handles != 0 {
+        warnings.push(format!(
+            "directory scan for {} may be incomplete: could not inspect {skipped_processes} processes and {unresolved_handles} handles (access restrictions or resources changed during the scan); try a terminal opened with 'Run as administrator'",
+            directory.display()
+        ));
+    }
     Ok(matches)
 }
 
@@ -542,9 +589,9 @@ fn directory_handle_owners(directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
 fn file_handle_owners(file: &StdPath) -> AppResult<BTreeSet<Pid>> {
     use std::ffi::OsStr;
 
-    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::RestartManager::{
-        CCH_RM_SESSION_KEY, RM_PROCESS_INFO, RmGetList, RmRegisterResources, RmStartSession,
+        CCH_RM_SESSION_KEY, RmGetList, RmRegisterResources, RmStartSession,
     };
 
     // The Restart Manager expects a plain DOS path, not a `\\?\` verbatim path.
@@ -581,47 +628,11 @@ fn file_handle_owners(file: &StdPath) -> AppResult<BTreeSet<Pid>> {
         );
     }
 
-    let mut needed = 0_u32;
-    let mut count = 0_u32;
     let mut reboot_reasons = 0_u32;
-    let status = unsafe {
-        RmGetList(
-            session.raw(),
-            &mut needed,
-            &mut count,
-            std::ptr::null_mut(),
-            &mut reboot_reasons,
-        )
-    };
-    if status == ERROR_SUCCESS || needed == 0 {
-        return Ok(BTreeSet::new());
-    }
-    if status != ERROR_MORE_DATA {
-        bail!(
-            "cannot list processes holding {}: RmGetList failed with error {status}",
-            file.display()
-        );
-    }
-
-    let mut infos = vec![RM_PROCESS_INFO::default(); needed as usize];
-    count = needed;
-    let status = unsafe {
-        RmGetList(
-            session.raw(),
-            &mut needed,
-            &mut count,
-            infos.as_mut_ptr(),
-            &mut reboot_reasons,
-        )
-    };
-    if status != ERROR_SUCCESS && status != ERROR_MORE_DATA {
-        bail!(
-            "cannot list processes holding {}: RmGetList failed with error {status}",
-            file.display()
-        );
-    }
-    let filled = (count as usize).min(infos.len());
-    infos.truncate(filled);
+    let infos = restart_manager_processes(|needed, count, infos| unsafe {
+        RmGetList(session.raw(), needed, count, infos, &mut reboot_reasons)
+    })
+    .with_context(|| format!("cannot list processes holding {}", file.display()))?;
 
     Ok(infos
         .into_iter()
@@ -629,6 +640,49 @@ fn file_handle_owners(file: &StdPath) -> AppResult<BTreeSet<Pid>> {
         .filter(|process_id| *process_id != 0)
         .map(Pid::from_u32)
         .collect())
+}
+
+#[cfg(windows)]
+fn restart_manager_processes(
+    mut query: impl FnMut(
+        &mut u32,
+        &mut u32,
+        *mut windows_sys::Win32::System::RestartManager::RM_PROCESS_INFO,
+    ) -> u32,
+) -> AppResult<Vec<windows_sys::Win32::System::RestartManager::RM_PROCESS_INFO>> {
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::RestartManager::RM_PROCESS_INFO;
+
+    let mut infos: Vec<RM_PROCESS_INFO> = Vec::new();
+    for _ in 0..8 {
+        let mut needed = 0;
+        let mut count = infos.len() as u32;
+        let pointer = if infos.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            infos.as_mut_ptr()
+        };
+        match query(&mut needed, &mut count, pointer) {
+            ERROR_SUCCESS => {
+                if count as usize > infos.len() {
+                    bail!("RmGetList returned an invalid process count");
+                }
+                infos.truncate(count as usize);
+                return Ok(infos);
+            }
+            ERROR_MORE_DATA => {
+                if needed as usize <= infos.len() {
+                    bail!("RmGetList requested more data without a larger buffer size");
+                }
+                infos.resize(needed as usize, RM_PROCESS_INFO::default());
+            }
+            status => bail!(
+                "RmGetList failed: {} (error {status})",
+                std::io::Error::from_raw_os_error(status as i32)
+            ),
+        }
+    }
+    bail!("RmGetList process list kept changing; retry the file query")
 }
 
 #[cfg(windows)]
@@ -651,7 +705,10 @@ impl Drop for RestartManagerSession {
 }
 
 #[cfg(unix)]
-fn directory_handle_owners(directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
+fn directory_handle_owners(
+    directory: &StdPath,
+    _warnings: &mut Vec<String>,
+) -> AppResult<BTreeSet<Pid>> {
     let output = std::process::Command::new("lsof")
         .arg("-t")
         .arg("+D")
@@ -700,7 +757,10 @@ fn parse_lsof_output(
 }
 
 #[cfg(not(any(windows, unix)))]
-fn directory_handle_owners(_directory: &StdPath) -> AppResult<BTreeSet<Pid>> {
+fn directory_handle_owners(
+    _directory: &StdPath,
+    _warnings: &mut Vec<String>,
+) -> AppResult<BTreeSet<Pid>> {
     Ok(BTreeSet::new())
 }
 
@@ -749,29 +809,29 @@ fn system_handles() -> AppResult<Vec<SystemHandleTableEntryInfoEx>> {
         .checked_mul(size_of::<SystemHandleTableEntryInfoEx>())
         .context("system handle table size overflow")?;
 
-    if buffer.len() < entries_offset + entries_size {
+    let entries_end = entries_offset
+        .checked_add(entries_size)
+        .context("system handle table size overflow")?;
+    if buffer.len() < entries_end {
         bail!("system handle table response was truncated");
     }
 
-    let entries = unsafe {
-        std::slice::from_raw_parts(
-            buffer.as_ptr().add(entries_offset) as *const SystemHandleTableEntryInfoEx,
-            handle_count,
-        )
-    };
-
-    Ok(entries.to_vec())
+    // A byte buffer does not guarantee the alignment required by the native struct.
+    Ok(buffer[entries_offset..entries_end]
+        .chunks_exact(size_of::<SystemHandleTableEntryInfoEx>())
+        .map(|entry| unsafe { std::ptr::read_unaligned(entry.as_ptr().cast()) })
+        .collect())
 }
 
 #[cfg(windows)]
-fn duplicated_handle_path(process_id: u32, handle_value: usize) -> Option<PathBuf> {
-    let source_process = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, process_id) };
-    let source_process = OwnedHandle::new(source_process)?;
-
+fn duplicated_handle_path(
+    source_process: HANDLE,
+    handle_value: usize,
+) -> AppResult<Option<PathBuf>> {
     let mut duplicated = std::ptr::null_mut::<c_void>();
     let duplicated_ok = unsafe {
         DuplicateHandle(
-            source_process.raw(),
+            source_process,
             handle_value as HANDLE,
             GetCurrentProcess(),
             &mut duplicated,
@@ -781,16 +841,17 @@ fn duplicated_handle_path(process_id: u32, handle_value: usize) -> Option<PathBu
         )
     };
     if duplicated_ok == 0 {
-        return None;
+        return Err(std::io::Error::last_os_error().into());
     }
 
-    let duplicated = OwnedHandle::new(duplicated)?;
+    let duplicated =
+        OwnedHandle::new(duplicated).context("DuplicateHandle returned a null handle")?;
     let file_type = unsafe { GetFileType(duplicated.raw()) };
     if file_type != FILE_TYPE_DISK {
-        return None;
+        return Ok(None);
     }
 
-    final_path_name(duplicated.raw())
+    final_path_name(duplicated.raw()).map(Some)
 }
 
 #[cfg(windows)]
@@ -823,7 +884,7 @@ impl Drop for OwnedHandle {
 }
 
 #[cfg(windows)]
-fn final_path_name(handle: HANDLE) -> Option<PathBuf> {
+fn final_path_name(handle: HANDLE) -> AppResult<PathBuf> {
     let flags = VOLUME_NAME_DOS | FILE_NAME_NORMALIZED;
     let mut buffer = vec![0_u16; 32_768];
     let written = unsafe {
@@ -831,7 +892,7 @@ fn final_path_name(handle: HANDLE) -> Option<PathBuf> {
     };
 
     if written == 0 {
-        return None;
+        return Err(std::io::Error::last_os_error().into());
     }
 
     if written as usize >= buffer.len() {
@@ -839,8 +900,11 @@ fn final_path_name(handle: HANDLE) -> Option<PathBuf> {
         let written = unsafe {
             GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, flags)
         };
-        if written == 0 || written as usize >= buffer.len() {
-            return None;
+        if written == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if written as usize >= buffer.len() {
+            bail!("file path kept changing while resolving handle");
         }
         buffer.truncate(written as usize);
     } else {
@@ -848,7 +912,7 @@ fn final_path_name(handle: HANDLE) -> Option<PathBuf> {
     }
 
     let path = String::from_utf16_lossy(&buffer);
-    Some(PathBuf::from(strip_windows_path_namespace(&path)))
+    Ok(PathBuf::from(strip_windows_path_namespace(&path)))
 }
 
 #[cfg(windows)]
@@ -871,7 +935,7 @@ fn path_matches_directory(path: &StdPath, directory: &StdPath) -> bool {
                 path == directory
                     || path
                         .strip_prefix(&directory)
-                        .is_some_and(|rest| rest.starts_with('\\'))
+                        .is_some_and(|rest| directory.ends_with('\\') || rest.starts_with('\\'))
             })
         })
 }
@@ -989,6 +1053,93 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("cannot resolve port :8080"));
         assert!(err.contains("socket enumeration failed"));
+        assert!(catalog.discovery_warnings().iter().any(|warning| {
+            warning.contains("ports unavailable") && warning.contains("permission denied")
+        }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restart_manager_retries_when_the_process_list_grows() {
+        use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+
+        let mut calls = 0;
+        let infos = super::restart_manager_processes(|needed, count, infos| {
+            calls += 1;
+            match calls {
+                1 => {
+                    assert!(infos.is_null());
+                    *needed = 1;
+                    ERROR_MORE_DATA
+                }
+                2 => {
+                    assert_eq!(*count, 1);
+                    *needed = 2;
+                    ERROR_MORE_DATA
+                }
+                3 => {
+                    assert_eq!(*count, 2);
+                    unsafe {
+                        (*infos).Process.dwProcessId = 42;
+                        (*infos.add(1)).Process.dwProcessId = 43;
+                    }
+                    *count = 2;
+                    ERROR_SUCCESS
+                }
+                _ => panic!("unexpected extra query"),
+            }
+        })
+        .expect("process list should be retried");
+        assert_eq!(infos.len(), 2);
+        assert_eq!(infos[0].Process.dwProcessId, 42);
+        assert_eq!(infos[1].Process.dwProcessId, 43);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restart_manager_does_not_hide_errors_with_zero_needed() {
+        let error = super::restart_manager_processes(|_, _, _| 5)
+            .err()
+            .expect("access denied must not become an empty list");
+        assert!(error.to_string().contains("error 5"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn restart_manager_bounds_retries_for_a_changing_list() {
+        let mut calls = 0;
+        let result = super::restart_manager_processes(|needed, count, _| {
+            calls += 1;
+            *needed = *count + 1;
+            234
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 8);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_directory_matching_respects_components_and_namespaces() {
+        use super::path_matches_directory;
+        use std::path::Path;
+
+        let root = Path::new(r"\\?\C:\Project");
+        assert!(path_matches_directory(
+            Path::new(r"c:\project\child\file.txt"),
+            root
+        ));
+        assert!(!path_matches_directory(
+            Path::new(r"C:\Project-other\file.txt"),
+            root
+        ));
+        assert!(path_matches_directory(
+            Path::new(r"\\server\share\project\file.txt"),
+            Path::new(r"\\?\UNC\SERVER\SHARE\Project"),
+        ));
+        assert!(path_matches_directory(
+            Path::new(r"C:\Project\file.txt"),
+            Path::new(r"\\?\C:\"),
+        ));
     }
 
     #[cfg(unix)]

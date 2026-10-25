@@ -14,7 +14,7 @@
 - Kill processes using files or directories under a directory tree: `fuckport --directory ./project`
 - Kill multiple targets in one run
 - Interactive picker when no target is provided
-- Graceful shutdown first, with automatic fallback to force kill
+- Graceful shutdown where supported, with automatic fallback to force kill
 
 ## Install
 
@@ -55,6 +55,7 @@ Options:
 - `-f, --force`: force kill immediately
 - `-c, --case-sensitive`: enable case-sensitive name matching
 - `-d, --directory <DIR>`: kill processes holding files or directories under `DIR`
+- `-F, --file <FILE>`: kill processes holding `FILE` open
 - `-i, --interactive`: open the interactive selector
 - `-s, --silent`: suppress success output
 - `-v, --verbose`: show more detail in interactive mode
@@ -104,6 +105,14 @@ To kill a port, prefix it with a colon, for example `:8080`.
 The interactive interface can be closed with `Esc` without killing anything.
 
 Process name matching is case-insensitive by default. Queries containing uppercase letters use smart-case matching.
+
+### Platform behavior
+
+- **macOS / Linux:** request shutdown with `SIGTERM`, then send `SIGKILL` after `--force-after-timeout`. Failed termination attempts can retry through `sudo`. File and directory inspection requires `lsof`.
+- **Windows:** post `WM_CLOSE` to the target process's desktop windows and wait for `--force-after-timeout`. If the process does not exit, or has no windows that accept the request, terminate it with `TerminateProcess`. Console applications and services have no generic graceful shutdown mechanism in this tool. `--force` skips window close requests.
+- Windows termination failures preserve the system error. For access denied, retry from a terminal opened with **Run as administrator**. The tool does not automatically trigger UAC; protected processes may remain inaccessible even with administrator permissions.
+- Windows file inspection uses Restart Manager. Directory inspection scans accessible disk handles and process working directories. Inaccessible processes or unresolved handles produce a warning that the result may be incomplete. Socket enumeration failures are shown as warnings, including in the interactive selector.
+- The process list and port mappings in the interactive selector are a startup snapshot.
 
 Library-style examples:
 

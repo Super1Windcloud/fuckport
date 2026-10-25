@@ -1,6 +1,6 @@
 [package]
 name = "fuckport"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version = "1.85"
 description = "A CLI for killing processes by PID, name, or port."
@@ -28,7 +28,7 @@ sysinfo = "0.38.4"
 unicode-width = "0.2.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_RestartManager"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_RestartManager", "Win32_UI_WindowsAndMessaging"] }
 
 
 [profile.dev]

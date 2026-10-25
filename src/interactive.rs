@@ -48,7 +48,12 @@ pub fn pick_interactive(catalog: &ProcessCatalog, verbose: bool) -> AppResult<BT
     }));
 
     let mut guard = TerminalGuard::enter().context("interactive mode failed")?;
-    let result = run_app(guard.terminal_mut(), records, verbose);
+    let result = run_app(
+        guard.terminal_mut(),
+        records,
+        verbose,
+        catalog.discovery_warnings(),
+    );
     guard.restore().context("failed to restore terminal")?;
 
     result.map(|state| state.selected_pids().into_iter().collect::<BTreeSet<_>>())
@@ -58,8 +63,10 @@ fn run_app(
     terminal: &mut DefaultTerminal,
     records: Vec<ProcessRecord>,
     verbose: bool,
+    warnings: Vec<String>,
 ) -> AppResult<AppState> {
     let mut state = AppState::new(records, verbose);
+    state.discovery_warning = warnings.into_iter().next();
     drain_pending_events()?;
 
     loop {
@@ -253,11 +260,13 @@ fn render_search(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             ""
         }
     );
-    let input = Paragraph::new(state.query.clone()).block(
-        Block::bordered()
-            .title(title)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
+    let mut block = Block::bordered()
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    if let Some(warning) = &state.discovery_warning {
+        block = block.title_bottom(Line::from(warning.as_str()).yellow());
+    }
+    let input = Paragraph::new(state.query.clone()).block(block);
     frame.render_widget(input, area);
 }
 
@@ -948,6 +957,7 @@ impl Widget for EmptyState {
 }
 
 struct AppState {
+    discovery_warning: Option<String>,
     records: Vec<ProcessRecord>,
     filtered_indexes: Vec<usize>,
     selected: BTreeSet<Pid>,
@@ -967,6 +977,7 @@ impl AppState {
         table_state.select(Some(0));
 
         Self {
+            discovery_warning: None,
             records,
             filtered_indexes,
             selected: BTreeSet::new(),
@@ -1355,6 +1366,25 @@ mod tests {
         assert!(fuzzy_match_score(&record, "922").is_some());
         assert!(fuzzy_match_score(&record, "cexp").is_some());
         assert!(fuzzy_match_score(&record, "firefox").is_none());
+    }
+
+    #[test]
+    fn selector_shows_socket_enumeration_failure() {
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut state = AppState::new(vec![sample_record()], false);
+        state.discovery_warning = Some("ports unavailable: socket enumeration failed".into());
+        terminal
+            .draw(|frame| super::draw(frame, &mut state))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("ports unavailable: socket enumeration failed"));
     }
 
     #[test]

@@ -22,8 +22,8 @@ fn run(cli: Cli) -> AppResult<()> {
     let mut catalog = ProcessCatalog::load()?;
     let interactive_mode = should_use_interactive(&cli);
 
-    let selected_pids = if interactive_mode {
-        pick_interactive(&catalog, cli.verbose)?
+    let selection = if interactive_mode {
+        pick_interactive(&catalog, cli.verbose)
     } else {
         let mut targets = parse_targets(&cli.targets);
         targets.extend(
@@ -33,8 +33,12 @@ fn run(cli: Cli) -> AppResult<()> {
                 .map(fuckport::input::Target::Directory),
         );
         targets.extend(cli.files.iter().cloned().map(fuckport::input::Target::File));
-        catalog.resolve_targets(&targets, cli.case_sensitive)?
+        catalog.resolve_targets(&targets, cli.case_sensitive)
     };
+    for warning in catalog.discovery_warnings() {
+        eprintln!("Warning: {warning}");
+    }
+    let selected_pids = selection?;
 
     if interactive_mode && selected_pids.is_empty() {
         return Ok(());
