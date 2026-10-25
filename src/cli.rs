@@ -24,6 +24,11 @@ fn help_styles() -> Styles {
     after_help = "Examples:\n  fuckport 1337\n  fuckport safari\n  fuckport :8080\n  fuckport 1337 safari :8080\n  fuckport"
 )]
 pub struct Cli {
+    /// Internal elevated helper: exact PID and expected process start time.
+    #[cfg(windows)]
+    #[arg(long, hide = true, num_args = 2, value_names = ["PID", "START_TIME"], value_parser = clap::value_parser!(u64), conflicts_with_all = ["targets", "directories", "files", "interactive"])]
+    pub elevated_kill: Vec<u64>,
+
     /// One or more targets: PID (`1234`), name (`chrome`), or port (`:3000`)
     #[arg(value_name = "TARGET")]
     pub targets: Vec<String>,

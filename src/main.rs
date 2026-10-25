@@ -19,6 +19,14 @@ fn main() {
 }
 
 fn run(cli: Cli) -> AppResult<()> {
+    #[cfg(windows)]
+    if let [pid, start_time] = cli.elevated_kill.as_slice() {
+        return fuckport::killer::kill_elevated_windows_process(
+            sysinfo::Pid::from_u32(u32::try_from(*pid)?),
+            *start_time,
+        );
+    }
+
     let mut catalog = ProcessCatalog::load()?;
     let interactive_mode = should_use_interactive(&cli);
 
@@ -91,6 +99,8 @@ mod tests {
         interactive: bool,
     ) -> Cli {
         Cli {
+            #[cfg(windows)]
+            elevated_kill: Vec::new(),
             targets,
             force: false,
             case_sensitive: false,

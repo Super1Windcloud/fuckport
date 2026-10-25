@@ -110,7 +110,7 @@ Process name matching is case-insensitive by default. Queries containing upperca
 
 - **macOS / Linux:** request shutdown with `SIGTERM`, then send `SIGKILL` after `--force-after-timeout`. Failed termination attempts can retry through `sudo`. File and directory inspection requires `lsof`.
 - **Windows:** post `WM_CLOSE` to the target process's desktop windows and wait for `--force-after-timeout`. If the process does not exit, or has no windows that accept the request, terminate it with `TerminateProcess`. Console applications and services have no generic graceful shutdown mechanism in this tool. `--force` skips window close requests.
-- Windows termination failures preserve the system error. For access denied, retry from a terminal opened with **Run as administrator**. The tool does not automatically trigger UAC; protected processes may remain inaccessible even with administrator permissions.
+- Windows termination failures preserve the system error. On access denied, the tool retries the exact PID and process start time through `sudo.exe`, which may prompt for UAC approval. Sudo for Windows must be installed and enabled. If sudo is unavailable or elevation is declined, retry from a terminal opened with **Run as administrator**. Protected processes may remain inaccessible even with administrator permissions.
 - Windows file inspection uses Restart Manager. Directory inspection scans accessible disk handles and process working directories. Inaccessible processes or unresolved handles produce a warning that the result may be incomplete. Socket enumeration failures are shown as warnings, including in the interactive selector.
 - The process list and port mappings in the interactive selector are a startup snapshot.
 

@@ -21,6 +21,35 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 static IGNORE_CLOSE: AtomicBool = AtomicBool::new(false);
 
+#[test]
+fn elevated_helper_checks_identity_and_terminates_only_matching_process() {
+    let (mut fixture, _) = Fixture::start("ignore-close", None);
+    let mut catalog = ProcessCatalog::load().unwrap();
+    catalog.refresh();
+    let start = catalog
+        .system()
+        .process(fixture.pid())
+        .unwrap()
+        .start_time();
+    assert_ne!(start, 0);
+
+    let pid = fixture.pid().as_u32().to_string();
+    let run_helper = |expected_start: u64| {
+        Command::new(env!("CARGO_BIN_EXE_fuckport"))
+            .args(["--elevated-kill", &pid, &expected_start.to_string()])
+            .output()
+            .unwrap()
+    };
+    let mismatch = run_helper(start + 1);
+    assert!(!mismatch.status.success());
+    assert!(String::from_utf8_lossy(&mismatch.stderr).contains("recycled PID"));
+    assert!(fixture.0.try_wait().unwrap().is_none());
+
+    let matching = run_helper(start);
+    assert!(matching.status.success(), "{:?}", matching);
+    fixture.0.wait().unwrap();
+}
+
 struct Fixture(Child);
 
 impl Fixture {

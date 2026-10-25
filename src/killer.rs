@@ -322,10 +322,63 @@ fn force_kill(catalog: &mut ProcessCatalog, pid: Pid) -> AppResult<bool> {
     }
 
     #[cfg(windows)]
-    return windows_force_kill(pid, expected_start);
+    return windows_force_kill(pid, expected_start).or_else(|error| {
+        if !is_windows_access_denied(&error) {
+            return Err(error);
+        }
+        let Some(start_time) = expected_start.filter(|start| *start != 0) else {
+            return Err(error);
+        };
+        let mut command = match windows_sudo_command(pid, start_time) {
+            Ok(command) => command,
+            Err(reason) => {
+                return Err(error.context(format!("cannot prepare sudo retry: {reason}")));
+            }
+        };
+        eprintln!(
+            "Access denied for PID {}; requesting elevation with sudo...",
+            pid.as_u32()
+        );
+        match command.status() {
+            Ok(status) if status.success() => Ok(true),
+            Ok(status) => Err(error.context(format!(
+                "sudo retry failed ({status}); protected processes may still deny termination"
+            ))),
+            Err(reason) => Err(error.context(format!("sudo retry unavailable: {reason}"))),
+        }
+    });
 
     #[cfg(not(windows))]
     Ok(process.kill())
+}
+
+#[cfg(windows)]
+fn windows_sudo_command(pid: Pid, start_time: u64) -> AppResult<std::process::Command> {
+    let mut command = std::process::Command::new("sudo.exe");
+    command
+        .arg(std::env::current_exe()?)
+        .arg("--elevated-kill")
+        .arg(pid.as_u32().to_string())
+        .arg(start_time.to_string());
+    Ok(command)
+}
+
+/// Internal entrypoint for the elevated helper; never retries through sudo.
+#[cfg(windows)]
+#[doc(hidden)]
+pub fn kill_elevated_windows_process(pid: Pid, start_time: u64) -> AppResult<()> {
+    if pid.as_u32() == std::process::id() || start_time == 0 {
+        bail!("invalid elevated kill identity");
+    }
+    windows_force_kill(pid, Some(start_time)).map(|_| ())
+}
+
+#[cfg(windows)]
+fn is_windows_access_denied(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
 }
 
 #[cfg(windows)]
@@ -372,14 +425,8 @@ fn windows_force_kill(pid: Pid, expected_start: Option<u64>) -> AppResult<bool> 
 
 #[cfg(windows)]
 fn windows_kill_error(error: std::io::Error) -> anyhow::Error {
-    use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
-
     let error = anyhow::Error::new(error);
-    if error
-        .downcast_ref::<std::io::Error>()
-        .and_then(std::io::Error::raw_os_error)
-        == Some(ERROR_ACCESS_DENIED as i32)
-    {
+    if is_windows_access_denied(&error) {
         error.context("access denied; run fuckport from a terminal opened with 'Run as administrator'; protected processes may still deny termination")
     } else {
         error.context("failed to terminate Windows process")
@@ -465,6 +512,30 @@ mod tests {
     fn zero_timeout_has_no_wait_intervals() {
         let intervals = backoff_intervals(Duration::from_millis(0));
         assert!(intervals.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sudo_command_preserves_exact_process_identity() {
+        let command = super::windows_sudo_command(Pid::from_u32(123), 456).unwrap();
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(command.get_program(), "sudo.exe");
+        assert_eq!(args[0], std::env::current_exe().unwrap());
+        assert_eq!(&args[1..], &["--elevated-kill", "123", "456"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_access_denied_allows_elevation() {
+        assert!(super::is_windows_access_denied(&super::windows_kill_error(
+            std::io::Error::from_raw_os_error(5)
+        )));
+        assert!(!super::is_windows_access_denied(
+            &super::windows_kill_error(std::io::Error::from_raw_os_error(87))
+        ));
+        assert!(!super::is_windows_access_denied(&anyhow::anyhow!(
+            "refusing to kill recycled PID"
+        )));
     }
 
     #[cfg(windows)]
