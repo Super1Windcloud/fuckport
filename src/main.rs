@@ -31,7 +31,7 @@ fn run(cli: Cli) -> AppResult<()> {
     let interactive_mode = should_use_interactive(&cli);
 
     let selection = if interactive_mode {
-        pick_interactive(&catalog, cli.verbose)
+        pick_interactive(&mut catalog, cli.verbose)
     } else {
         let mut targets = parse_targets(&cli.targets);
         targets.extend(

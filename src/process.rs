@@ -62,9 +62,13 @@ struct SystemHandleTableEntryInfoEx {
 use crate::error::AppResult;
 use crate::input::Target;
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 #[derive(Clone, Debug)]
 pub struct ProcessRecord {
     pub pid: Pid,
+    pub start_time: u64,
     pub app_name: String,
     pub name: String,
     pub cmd: String,
@@ -117,6 +121,38 @@ impl ProcessCatalog {
         refresh_processes(&mut self.system);
     }
 
+    pub(crate) fn refresh_interactive(&mut self) {
+        // CPU deltas use the elapsed time since the preceding snapshot. No second
+        // sample or sleep is needed during the interactive refresh.
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing()
+                .with_exe(UpdateKind::Always)
+                .with_cmd(UpdateKind::Always)
+                .with_cwd(UpdateKind::OnlyIfNotSet)
+                .with_cpu()
+                .with_memory(),
+        );
+        match port_map() {
+            Ok(map) => {
+                self.pids_by_port = map;
+                self.port_error = None;
+            }
+            Err(error) => {
+                self.pids_by_port.clear();
+                self.port_error = Some(error.to_string());
+            }
+        }
+        self.ports_by_pid = reverse_port_map(&self.pids_by_port);
+        self.initial_start_times = self
+            .system
+            .processes()
+            .iter()
+            .map(|(pid, process)| (*pid, process.start_time()))
+            .collect();
+    }
+
     pub fn refresh_pid(&mut self, pid: Pid) -> bool {
         self.system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[pid]),
@@ -153,17 +189,19 @@ impl ProcessCatalog {
     }
 
     pub fn process_records(&self) -> Vec<ProcessRecord> {
+        let mut app_names = AppNameResolver::default();
         let mut records = self
             .system
             .processes()
             .values()
             .map(|process| ProcessRecord {
                 pid: process.pid(),
-                app_name: app_name_for_process(process),
+                start_time: process.start_time(),
+                app_name: app_names.for_process(process),
                 name: process.name().to_string_lossy().into_owned(),
                 cmd: join_cmd(process.cmd()),
                 cpu_usage: process.cpu_usage(),
-                memory_bytes: process.memory(),
+                memory_bytes: process_memory_bytes(process),
                 ports: self
                     .ports_by_pid
                     .get(&process.pid())
@@ -317,24 +355,48 @@ fn join_cmd(parts: &[OsString]) -> String {
         .join(" ")
 }
 
-fn app_name_for_process(process: &sysinfo::Process) -> String {
-    if let Some(exe) = process.exe() {
-        #[cfg(windows)]
-        if let Some(description) = windows_file_description(exe) {
-            return description;
+fn process_memory_bytes(process: &sysinfo::Process) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        macos::memory_bytes(process.pid(), process.memory())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        process.memory()
+    }
+}
+
+#[derive(Default)]
+struct AppNameResolver {
+    #[cfg(target_os = "macos")]
+    macos: macos::AppNames,
+}
+
+impl AppNameResolver {
+    fn for_process(&mut self, process: &sysinfo::Process) -> String {
+        if let Some(exe) = process.exe() {
+            #[cfg(target_os = "macos")]
+            if let Some(name) = self.macos.for_executable(exe) {
+                return name;
+            }
+
+            #[cfg(windows)]
+            if let Some(description) = windows_file_description(exe) {
+                return description;
+            }
+
+            if let Some(name) = file_name_value(exe) {
+                return name;
+            }
         }
 
-        if let Some(name) = file_name_value(exe) {
-            return name;
+        let process_name = process.name().to_string_lossy().trim().to_string();
+        if !process_name.is_empty() {
+            return process_name;
         }
-    }
 
-    let process_name = process.name().to_string_lossy().trim().to_string();
-    if !process_name.is_empty() {
-        return process_name;
+        String::from("<unknown>")
     }
-
-    String::from("<unknown>")
 }
 
 fn file_name_value(path: &StdPath) -> Option<String> {
@@ -1056,6 +1118,38 @@ mod tests {
         assert!(catalog.discovery_warnings().iter().any(|warning| {
             warning.contains("ports unavailable") && warning.contains("permission denied")
         }));
+    }
+
+    #[test]
+    fn interactive_refresh_updates_ports_and_clears_stale_errors() {
+        use std::net::TcpListener;
+
+        let mut catalog = ProcessCatalog::load().expect("failed to load catalog");
+        catalog.port_error = Some("old socket enumeration failure".into());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind test socket");
+        let port = listener.local_addr().unwrap().port();
+        let pid = catalog.current_pid();
+
+        catalog.refresh_interactive();
+        assert!(catalog.port_error.is_none(), "{:?}", catalog.port_error);
+        assert!(catalog.pids_by_port[&port].contains(&pid));
+        assert!(catalog.ports_by_pid[&pid].contains(&port));
+        assert_eq!(
+            catalog.initial_start_time(pid),
+            catalog
+                .system()
+                .process(pid)
+                .map(|process| process.start_time())
+        );
+
+        drop(listener);
+        catalog.refresh_interactive();
+        assert!(
+            !catalog
+                .ports_by_pid
+                .get(&pid)
+                .is_some_and(|ports| ports.contains(&port))
+        );
     }
 
     #[cfg(windows)]

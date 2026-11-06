@@ -1,6 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -31,8 +31,9 @@ const PROCESS_MIN_WIDTH: u16 = 20;
 const PROCESS_MAX_WIDTH: u16 = 42;
 const PORTS_MIN_WIDTH: u16 = 8;
 const PORTS_MAX_WIDTH: u16 = 18;
+const REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
-pub fn pick_interactive(catalog: &ProcessCatalog, verbose: bool) -> AppResult<BTreeSet<Pid>> {
+pub fn pick_interactive(catalog: &mut ProcessCatalog, verbose: bool) -> AppResult<BTreeSet<Pid>> {
     let records = catalog.process_records();
     if records.is_empty() {
         return Ok(BTreeSet::new());
@@ -53,6 +54,7 @@ pub fn pick_interactive(catalog: &ProcessCatalog, verbose: bool) -> AppResult<BT
         records,
         verbose,
         catalog.discovery_warnings(),
+        catalog,
     );
     guard.restore().context("failed to restore terminal")?;
 
@@ -64,17 +66,27 @@ fn run_app(
     records: Vec<ProcessRecord>,
     verbose: bool,
     warnings: Vec<String>,
+    catalog: &mut ProcessCatalog,
 ) -> AppResult<AppState> {
     let mut state = AppState::new(records, verbose);
     state.discovery_warning = warnings.into_iter().next();
     drain_pending_events()?;
+    let mut last_refresh = Instant::now();
 
     loop {
+        if last_refresh.elapsed() >= REFRESH_INTERVAL {
+            last_refresh = Instant::now();
+            catalog.refresh_interactive();
+            state.replace_records(catalog.process_records(), catalog.discovery_warnings());
+        }
         terminal
             .draw(|frame| draw(frame, &mut state))
             .context("failed to draw interactive UI")?;
 
-        if event::poll(Duration::from_millis(200)).context("failed to read terminal events")?
+        let poll_timeout = REFRESH_INTERVAL
+            .saturating_sub(last_refresh.elapsed())
+            .min(Duration::from_millis(200));
+        if event::poll(poll_timeout).context("failed to read terminal events")?
             && let Event::Key(key) = event::read().context("failed to read key event")?
             && handle_key_event(&mut state, key)
         {
@@ -503,7 +515,10 @@ fn render_table(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         )
         .block(
             Block::default()
-                .title(" Processes ")
+                .title(format!(
+                    " Processes (refresh: {}s) ",
+                    REFRESH_INTERVAL.as_secs()
+                ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Blue)),
         );
@@ -998,6 +1013,40 @@ impl AppState {
             .collect()
     }
 
+    fn replace_records(&mut self, records: Vec<ProcessRecord>, warnings: Vec<String>) {
+        let focused = self
+            .current_record()
+            .map(|record| (record.pid, record.start_time));
+        let previous_cursor = self.cursor;
+        let selected_start_times = self
+            .records
+            .iter()
+            .filter(|record| self.selected.contains(&record.pid))
+            .map(|record| (record.pid, record.start_time))
+            .collect::<BTreeMap<_, _>>();
+        let start_times = records
+            .iter()
+            .map(|record| (record.pid, record.start_time))
+            .collect::<BTreeMap<_, _>>();
+        self.selected.retain(|pid| {
+            selected_start_times
+                .get(pid)
+                .is_some_and(|start_time| start_times.get(pid) == Some(start_time))
+        });
+        self.records = records;
+        self.discovery_warning = warnings.into_iter().next();
+        self.refresh_filter();
+        self.cursor = self
+            .filtered_indexes
+            .iter()
+            .position(|index| {
+                let record = &self.records[*index];
+                Some((record.pid, record.start_time)) == focused
+            })
+            .unwrap_or(previous_cursor);
+        self.sync_table_state();
+    }
+
     fn selected_pids(&self) -> Vec<Pid> {
         if self.cancelled {
             Vec::new()
@@ -1350,6 +1399,7 @@ mod tests {
     fn sample_record() -> ProcessRecord {
         ProcessRecord {
             pid: Pid::from_u32(42),
+            start_time: 1,
             app_name: "chrome".to_string(),
             name: "chrome.exe".to_string(),
             cmd: "chrome.exe --profile".to_string(),
@@ -1469,6 +1519,82 @@ mod tests {
         state.select_all_filtered();
 
         assert!(state.selected.is_empty());
+    }
+
+    #[test]
+    fn refresh_preserves_search_sort_selection_and_focus_after_reordering() {
+        let first = sample_record();
+        let mut second = sample_record();
+        second.pid = Pid::from_u32(99);
+        second.memory_bytes = 1024;
+        let mut state = AppState::new(vec![first.clone(), second.clone()], true);
+        state.query = "chrm".into();
+        state.search_mode = SearchMode::Fuzzy;
+        state.set_sort_mode(SortMode::Memory);
+        state.move_down();
+        state.toggle_current();
+        state.discovery_warning = Some("old socket error".into());
+
+        second.memory_bytes = first.memory_bytes * 2;
+        second.cpu_usage = 25.0;
+        second.ports = BTreeSet::from([8080]);
+        let mut newcomer = sample_record();
+        newcomer.pid = Pid::from_u32(100);
+        state.replace_records(vec![first, second, newcomer], Vec::new());
+
+        assert_eq!(state.query, "chrm");
+        assert!(matches!(state.search_mode, SearchMode::Fuzzy));
+        assert!(matches!(state.sort_mode, SortMode::Memory));
+        assert!(state.verbose);
+        assert_eq!(state.current_pid(), Some(Pid::from_u32(99)));
+        assert_eq!(state.cursor, 0);
+        assert_eq!(state.selected, BTreeSet::from([Pid::from_u32(99)]));
+        assert_eq!(state.filtered_records().len(), 3);
+        let focused = state.current_record().unwrap();
+        assert_eq!(focused.memory_bytes, 1024 * 1024 * 1024);
+        assert_eq!(focused.cpu_usage, 25.0);
+        assert_eq!(focused.ports, BTreeSet::from([8080]));
+        assert!(state.discovery_warning.is_none());
+    }
+
+    #[test]
+    fn refresh_discards_exited_and_reused_pid_selections() {
+        let first = sample_record();
+        let mut second = sample_record();
+        second.pid = Pid::from_u32(99);
+        let mut third = sample_record();
+        third.pid = Pid::from_u32(100);
+        let mut state = AppState::new(vec![first.clone(), second.clone(), third], false);
+        state.select_all_filtered();
+        state.jump_to_end();
+
+        second.start_time += 1;
+        state.replace_records(vec![first, second], vec!["ports unavailable".into()]);
+
+        assert_eq!(state.selected, BTreeSet::from([Pid::from_u32(42)]));
+        assert_eq!(state.records.len(), 2);
+        assert_eq!(state.cursor, 1);
+        assert_eq!(state.table_state.selected(), Some(1));
+        assert_eq!(
+            state.discovery_warning.as_deref(),
+            Some("ports unavailable")
+        );
+    }
+
+    #[test]
+    fn refresh_handles_empty_list_and_does_not_select_returning_processes() {
+        let mut state = AppState::new(vec![sample_record()], false);
+        state.select_all_filtered();
+        state.replace_records(Vec::new(), Vec::new());
+
+        assert!(state.selected.is_empty());
+        assert!(state.current_record().is_none());
+        assert_eq!(state.table_state.selected(), None);
+
+        state.replace_records(vec![sample_record()], Vec::new());
+        assert!(state.selected.is_empty());
+        assert_eq!(state.current_pid(), Some(Pid::from_u32(42)));
+        assert_eq!(state.table_state.selected(), Some(0));
     }
 
     #[test]
